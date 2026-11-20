@@ -1,0 +1,48 @@
+{
+  "name": "openchamber-dingtalk-connector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "把钉钉机器人（Stream 模式）接到 OpenChamber：在钉钉里和 agent 聊天，权限、提问、回复双向同步",
+  "type": "module",
+  "scripts": {
+    "build": "bun x openchamber-guest-bundle panel/main.ts panel/main.js && bun x openchamber-guest-bundle --node service/main.ts service/main.js && bun x openchamber-guest-bundle --node plugin/index.ts plugin/index.js",
+    "check": "bun x openchamber-guest-check",
+    "test": "bun test tests",
+    "service": "node service/main.js"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": { "openchamber": ">=2.7.3" },
+    "id": "dingtalk",
+    "name": "钉钉桥接",
+    "icon": "icon.svg",
+    "contributes": {
+      "panel": { "entry": "panel/index.html" },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "keepRunning": true
+      },
+      "sessionControl": { "answers": true },
+      "sessionEvents": {
+        "events": [
+          "turn-started",
+          "turn-finished",
+          "turn-failed",
+          "permission-asked",
+          "question-asked"
+        ],
+        "content": true
+      },
+      "opencodePlugin": "plugin"
+    }
+  },
+  "dependencies": {
+    "@openchamber/sdk": "2.7.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12",
+    "jsdom": "^31.0.1"
+  }
+}

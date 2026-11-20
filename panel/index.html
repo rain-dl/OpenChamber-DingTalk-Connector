@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>钉钉桥接</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: transparent;
+      }
+      body {
+        padding: 12px;
+        color: var(--oc-fg);
+        font-family: var(--oc-font);
+        font-size: 0.875rem;
+        line-height: 1.45;
+      }
+      #root {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .dt-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .dt-title {
+        font-size: 1rem;
+        font-weight: 600;
+      }
+      .dt-section {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .dt-section-title {
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--oc-muted);
+      }
+      .dt-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      .dt-fill {
+        flex: 1 1 140px;
+        min-width: 120px;
+      }
+      .dt-status {
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--oc-fg);
+      }
+      .dt-activity {
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--oc-muted);
+        font-size: 0.8125rem;
+      }
+      .dt-hint {
+        color: var(--oc-muted);
+        font-size: 0.8125rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="./main.js"></script>
+  </body>
+</html>
