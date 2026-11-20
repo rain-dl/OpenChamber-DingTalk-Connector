@@ -493,7 +493,7 @@ export function createDingTalkApi(options: ApiOptions = {}) {
     const form = new FormData();
     form.append(
       "media",
-      new Blob([opts.bytes], { type: opts.mediaType ?? "application/octet-stream" }),
+      new Blob([new Uint8Array(opts.bytes)], { type: opts.mediaType ?? "application/octet-stream" }),
       opts.fileName,
     );
     const uploaded = await requestMultipart(url, form, opts.signal);

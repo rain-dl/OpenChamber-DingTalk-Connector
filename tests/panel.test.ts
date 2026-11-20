@@ -51,10 +51,13 @@ describe('面板', () => {
     expect(buttons).toContain('断开');
     expect(buttons).toContain('保存设置');
     expect(buttons).toContain('解除绑定');
+    expect(buttons).toContain('填入当前绑定用户');
     expect(buttons).toContain('刷新');
 
     expect(document.body.textContent).toContain('钉钉桥接');
     expect(document.body.textContent).toContain('未配置');
+    // 分隔条曾经被当成节点 append 进来，页面上出现 [object Object]。
+    expect(document.body.textContent).not.toContain('[object Object]');
   });
 
   test('输入会进入草稿状态（不抛异常）', () => {

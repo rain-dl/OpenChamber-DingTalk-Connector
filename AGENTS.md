@@ -28,7 +28,8 @@ tests/            bun test（含 jsdom 面板冒烟）
 ```bash
 bun run build     # 三份产物
 bun run check     # 宿主安装时会拒绝的问题（等价于 Settings → Extensions 的检查）
-bun test          # 68+ 项：格式解析、配置、桥接、Stream 协议（假网关）、插件投递、面板 jsdom
+bun run typecheck # tsc：面板、服务、插件、测试
+bun test          # 81+ 项：格式解析、配置、桥接、Stream 协议（假网关）、插件投递、面板 jsdom
 ```
 
 服务单独验收：

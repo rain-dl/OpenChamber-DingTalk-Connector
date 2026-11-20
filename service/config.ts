@@ -156,7 +156,7 @@ export function normalizeStore(value: unknown): Store {
     ? raw.activity
       .map((item) => (item && typeof item === 'object' ? (item as Record<string, unknown>) : null))
       .filter((item): item is Record<string, unknown> => item !== null && !!text(item.text))
-      .map((item) => ({
+      .map((item): ActivityEntry => ({
         at: Number.isFinite(item.at) ? Number(item.at) : 0,
         kind: item.kind === 'in' || item.kind === 'out' || item.kind === 'error' ? item.kind : 'state',
         text: text(item.text).slice(0, 200),

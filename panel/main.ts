@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 钉钉桥接面板：凭据、会话目录、连接状态。
  *
  * 页面本身没有任何网络能力，所有读写都走 `host.serviceRequest` 到本地服务。
@@ -18,22 +18,13 @@ import {
 } from '@openchamber/sdk/ui';
 import type { BannerProps } from '@openchamber/sdk/ui';
 
-type StatusPayload = {
-  configured: boolean;
-  enabled: boolean;
-  clientId?: string;
-  hasSecret?: boolean;
-  robotCode: string;
-  cardTemplate: boolean;
-  directory: string;
-  allowedUsers: string[];
-  notifyOtherSessions: boolean;
-  ownerUserId: string | null;
-  stream: { state: string; connected: boolean; registered: boolean; lastError: string | null; messages: number } | null;
-  binding: { userId: string; sessionId: string; title: string; directory: string; since: number } | null;
-  pending: Array<{ kind: string; title: string }>;
-  activity: Array<{ at: number; kind: string; text: string }>;
-};
+import {
+  allowedHelper,
+  connectionBadge,
+  initialDirectory,
+  statusLines,
+  type StatusPayload,
+} from './view.js';
 
 const host = connectHost();
 const root = document.querySelector<HTMLElement>('#root')!;
@@ -177,7 +168,7 @@ const useDirectoryButton = mountButton(sessionSection, {
   size: 'sm',
   onClick: () => {
     if (!currentDirectory) {
-      void host.toast({ kind: 'warning', message: '还没有打开任何项目。' });
+      void host.toast({ kind: 'info', message: '还没有打开任何项目，请先打开一个项目或手动填写目录。' });
       return;
     }
     draft.directory = currentDirectory;
@@ -192,6 +183,19 @@ const allowedField = mountTextField(sessionSection, {
   helper: '多个用逗号分隔；填了就只回应这些人。',
   onChange: (value) => {
     draft.allowedUsers = value;
+  },
+});
+
+const pinUserButton = mountButton(sessionSection, {
+  label: '填入当前绑定用户',
+  variant: 'ghost',
+  size: 'sm',
+  disabled: true,
+  onClick: () => {
+    const owner = lastStatus?.ownerUserId;
+    if (!owner) return;
+    draft.allowedUsers = owner;
+    allowedField.update({ value: owner });
   },
 });
 
@@ -223,7 +227,7 @@ mountButton(sessionRow, {
 
 // ─── 状态 ─────────────────────────────────────────────────────────────
 
-root.append(mountSeparator(root, { label: '状态' }));
+mountSeparator(root, { label: '状态' });
 root.append(statusText);
 root.append(activityText);
 
@@ -319,65 +323,54 @@ function apply(status: StatusPayload): void {
   lastStatus = status;
   if (!loaded) {
     loaded = true;
+    const directory = initialDirectory(status, currentDirectory);
     draft.clientId = status.clientId ?? '';
     draft.robotCode = status.robotCode ?? '';
-    draft.directory = status.directory ?? '';
+    draft.directory = directory.value;
     draft.allowedUsers = status.allowedUsers.join(', ');
     draft.notifyOtherSessions = status.notifyOtherSessions;
     clientIdField.update({ value: draft.clientId });
     robotField.update({ value: draft.robotCode });
-    directoryField.update({ value: draft.directory });
+    directoryField.update({
+      value: draft.directory,
+      ...(directory.prefillHint ? { helper: directory.prefillHint } : {}),
+    });
     allowedField.update({ value: draft.allowedUsers });
     notifySwitch.update({ checked: draft.notifyOtherSessions });
     secretField.update({ placeholder: status.hasSecret ? '已保存，留空则不修改' : '填 AppSecret' });
   }
 
+  // 绑定用户变了要让用户看见：说明文字和「填入」按钮每次都跟着刷新。
+  allowedField.update({ helper: allowedHelper(status) });
+  pinUserButton.update({ disabled: !status.ownerUserId });
+
   const stream = status.stream;
+  badge.update(connectionBadge(status));
   if (!status.configured) {
-    badge.update({ label: '未配置', tone: 'neutral' });
     setBanner({
       tone: 'info',
       title: '先填三项',
       body: '在钉钉开放平台建一个企业内部应用，加上机器人并选择 Stream 模式，然后把 AppKey、AppSecret、RobotCode 填在这里。',
     });
   } else if (!status.enabled) {
-    badge.update({ label: '已关闭', tone: 'neutral' });
     setBanner({ tone: 'warning', title: '桥接已关闭', body: '点「保存并连接」会重新连上钉钉。' });
-  } else if (stream?.connected && stream.registered) {
-    badge.update({ label: '已连接', tone: 'success' });
-    setBanner(null);
-  } else if (stream?.lastError) {
-    badge.update({ label: '连接异常', tone: 'error' });
+  } else if (!stream?.connected && stream?.lastError) {
     setBanner({
       tone: 'error',
       title: '连不上钉钉',
       body: `${stream.lastError}\n检查 AppKey / AppSecret，以及这台机器能否访问 api.dingtalk.com。`,
     });
+  } else if (status.ownerUserId && !status.binding && !status.directory) {
+    setBanner({
+      tone: 'warning',
+      title: '还差默认项目目录',
+      body: `钉钉用户 ${status.ownerUserId} 已经和机器人说上话，但没有目录就没法建会话：在下面选好项目目录并「保存设置」，再在钉钉里发一条消息。`,
+    });
   } else {
-    badge.update({ label: '连接中', tone: 'info' });
     setBanner(null);
   }
 
-  const lines = [
-    `机器人：${status.robotCode || '（未设置）'}`,
-    `连接：${stream ? `${stream.connected ? '已连接' : '未连接'} · ${stream.state}${stream.registered ? ' · 已注册' : ''}` : '未启动'}`,
-    `已收消息：${stream?.messages ?? 0} 条`,
-  ];
-  if (status.binding) {
-    lines.push(
-      `绑定会话：${status.binding.title || '未命名'}`,
-      `  会话 ID：${status.binding.sessionId}`,
-      `  目录：${status.binding.directory || '（未知）'}`,
-    );
-  } else {
-    lines.push('绑定会话：未绑定（下一条钉钉消息会新建）');
-  }
-  lines.push(`默认目录：${status.directory || '（未设置）'}`);
-  if (status.pending.length > 0) {
-    lines.push(`等你回答：${status.pending.length} 个请求（回复 1 允 / 2 拒，或按提示回答）`);
-  }
-  if (status.allowedUsers.length > 0) lines.push(`白名单：${status.allowedUsers.join(', ')}`);
-  statusText.textContent = lines.join('\n');
+  statusText.textContent = statusLines(status).join('\n');
 
   const activity = status.activity.slice(0, 6).map((entry) => {
     const time = new Date(entry.at).toLocaleTimeString('zh-CN', { hour12: false });
@@ -390,6 +383,14 @@ function apply(status: StatusPayload): void {
 
 host.onDirectory((directory) => {
   currentDirectory = directory;
+  // 还没填过目录时，打开的项目就是最合理的默认值；只填空的，绝不覆盖用户输入。
+  if (directory && !draft.directory.trim()) {
+    draft.directory = directory;
+    directoryField.update({
+      value: directory,
+      helper: '已填入当前项目目录，点「保存设置」后生效。',
+    });
+  }
 });
 
 host.onServiceEvent((event) => {

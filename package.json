@@ -7,23 +7,30 @@
   "scripts": {
     "build": "bun x openchamber-guest-bundle panel/main.ts panel/main.js && bun x openchamber-guest-bundle --node service/main.ts service/main.js && bun x openchamber-guest-bundle --node plugin/index.ts plugin/index.js",
     "check": "bun x openchamber-guest-check",
+    "typecheck": "bun x tsc -p tsconfig.json --noEmit",
     "test": "bun test tests",
     "service": "node service/main.js"
   },
   "openchamber": {
     "apiVersion": 1,
-    "engines": { "openchamber": ">=2.7.3" },
+    "engines": {
+      "openchamber": ">=2.7.3"
+    },
     "id": "dingtalk",
     "name": "钉钉桥接",
     "icon": "icon.svg",
     "contributes": {
-      "panel": { "entry": "panel/index.html" },
+      "panel": {
+        "entry": "panel/index.html"
+      },
       "service": {
         "entry": "service/main.js",
         "runtime": "host",
         "keepRunning": true
       },
-      "sessionControl": { "answers": true },
+      "sessionControl": {
+        "answers": true
+      },
       "sessionEvents": {
         "events": [
           "turn-started",
@@ -42,7 +49,11 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.5",
+    "@types/jsdom": "^30.0.0",
+    "@types/node": "^26.6.6",
     "@types/ws": "^8.5.12",
-    "jsdom": "^31.0.1"
+    "jsdom": "^31.0.1",
+    "typescript": "^7.0.2"
   }
 }

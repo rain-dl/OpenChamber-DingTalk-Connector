@@ -1,0 +1,17 @@
+﻿{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": false,
+    "types": ["bun", "node"]
+  },
+  "include": ["panel/**/*.ts", "service/**/*.ts", "plugin/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "**/*.js"]
+}

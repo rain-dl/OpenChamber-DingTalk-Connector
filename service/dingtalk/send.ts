@@ -25,7 +25,7 @@ import {
 /** Everything a send needs: the API client, the credentials, and the route. */
 export interface SendContext {
   api: DingTalkApi;
-  credentials: DingTalkCredentials;
+  credentials: Pick<DingTalkCredentials, 'clientId' | 'clientSecret'>;
   robotCode: string;
   /** Reply webhook captured from the latest inbound message. */
   target?: ReplyTarget;

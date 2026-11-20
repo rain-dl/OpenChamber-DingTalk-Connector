@@ -3644,7 +3644,7 @@ function createDingTalkApi(options = {}) {
     url.searchParams.set("access_token", token);
     url.searchParams.set("type", opts.uploadType);
     const form = new FormData;
-    form.append("media", new Blob([opts.bytes], { type: opts.mediaType ?? "application/octet-stream" }), opts.fileName);
+    form.append("media", new Blob([new Uint8Array(opts.bytes)], { type: opts.mediaType ?? "application/octet-stream" }), opts.fileName);
     const uploaded = await requestMultipart(url, form, opts.signal);
     const rejection = rejectedProviderResponse(uploaded);
     const mediaId = nonEmpty2(uploaded.media_id);
@@ -6057,7 +6057,10 @@ async function startStream() {
     return;
   const client = new DingTalkStream({
     credentials: { clientId: settings.clientId, clientSecret: settings.clientSecret },
-    onMessage: (payload) => bridge.handleInbound(payload),
+    onMessage: (payload) => {
+      bridge.handleInbound(payload);
+      emitState();
+    },
     logger: console,
     onStateChange: (status) => {
       streamStatus = status;

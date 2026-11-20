@@ -150,7 +150,11 @@ async function startStream(): Promise<void> {
 
   const client = new DingTalkStream({
     credentials: { clientId: settings.clientId, clientSecret: settings.clientSecret },
-    onMessage: (payload) => bridge.handleInbound(payload),
+    onMessage: (payload) => {
+      bridge.handleInbound(payload);
+      // 每条入站消息都会改变“已收消息 / 已注册 / 绑定”，让面板立刻看到，别停在旧快照上。
+      emitState();
+    },
     logger: console,
     onStateChange: (status) => {
       streamStatus = status;
