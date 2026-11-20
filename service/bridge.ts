@@ -41,6 +41,7 @@ import {
   renderPermissionAsk,
   renderQuestionAsk,
 } from './format.js';
+import { readHostProjects } from './host-projects.js';
 import type { OpenCodeReader } from './opencode.js';
 import { parseSlashCommand, splitMergeSuffix, DROPPED_COMMANDS, type SlashCommand } from './slash.js';
 
@@ -946,37 +947,24 @@ export class Bridge {
       return;
     }
 
-    const reader = await this.requireReader(target);
-    if (!reader) return;
-
     if (command.action === 'list') {
-      const activeOnly = command.scope !== 'all';
       const directory = command.scope === 'current'
         ? (binding?.directory || this.store.settings.directory)
         : undefined;
-      const sessions = await reader.listSessions({
-        activeOnly,
-        ...(directory ? { directory } : {}),
-      });
+      const reader = await this.requireReader(target);
+      if (!reader) return;
+      const sessions = await reader.listSessions(directory ? { directory } : {});
+
       if (sessions.length === 0) {
-        await this.reply(
-          target,
-          activeOnly
-            ? '现在没有正在运行的会话。`/s list all` 可以看全部（已完成的不在默认列表里，归档的也不列）。'
-            : directory
-              ? `\`${directory}\` 下还没有会话。`
-              : '还没有任何会话。',
-        );
+        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : '还没有任何会话。');
         return;
       }
+
       const limit = command.limit === 'all' ? sessions.length : Math.min(command.limit, sessions.length);
       const page = sessions.slice(0, limit);
       this.lastSessionList = page.map((session) => session.id);
-      const scopeNote = activeOnly
-        ? (directory ? '当前目录，进行中，' : '进行中，')
-        : (directory ? '当前目录，' : '');
       const lines = [
-        `🗂 **会话**（${scopeNote}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
+        `🗂 **会话**（${directory ? '当前目录，' : ''}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
         '',
       ];
       page.forEach((session, index) => {
@@ -984,19 +972,20 @@ export class Bridge {
         const where = session.directory ? ` · ${session.directory}` : '';
         lines.push(`${index + 1}. ${session.title}${mark}`, `   \`${session.id}\`${where} · ${relativeTime(session.updatedAt)}`);
       });
-      lines.push('', '切换：`/s switch 序号`；看全部（含已完成）：`/s list all`；只看当前项目：`/s list current`');
+      lines.push('', '切换：`/s switch 序号`；只看当前项目：`/s list current`');
       await this.reply(target, lines.join('\n'));
       return;
     }
 
-    // switch：编号按最近一次 /s list 的顺序（没有就先取全部未归档的会话）。
+    // switch：编号按最近一次 /s list 的顺序（没有就先取未归档的会话）。
     let sessionId = command.target;
     if (/^\d+$/.test(command.target)) {
       const index = Number(command.target);
       let source = this.lastSessionList;
       if (source.length === 0) {
-        const all = await reader.listSessions();
-        source = all.map((session) => session.id);
+        const reader = await this.requireReader(target);
+        if (!reader) return;
+        source = (await reader.listSessions()).map((session) => session.id);
         this.lastSessionList = source;
       }
       sessionId = source[index - 1] ?? '';
@@ -1006,12 +995,16 @@ export class Bridge {
       }
     }
 
-    const all = await reader.listSessions();
-    const found = all.find((session) => session.id === sessionId || session.id.startsWith(sessionId));
-    if (!found) {
+    const reader = await this.requireReader(target);
+    if (!reader) return;
+    const session = (await reader.listSessions()).find(
+      (item) => item.id === sessionId || item.id.startsWith(sessionId),
+    );
+    if (!session) {
       await this.reply(target, `没有找到会话「${command.target}」。`);
       return;
     }
+    const found = { id: session.id, directory: session.directory, title: session.title };
     await this.closeCards('已切换会话，这张卡片结束了。');
     await this.store.setBinding({
       userId: message.senderId,
@@ -1058,23 +1051,34 @@ export class Bridge {
     }
 
     if (command.action === 'list') {
-      const reader = await this.requireReader(target);
-      if (!reader) return;
-      const projects = await reader.listProjects();
+      // OpenChamber 里“已打开的项目”在应用的配置里；读不到就退回 OpenCode 的项目注册。
+      let projects = await readHostProjects();
+      let source = 'OpenChamber 已打开的项目';
       if (projects.length === 0) {
-        await this.reply(target, '没有找到项目：`/ws status` 看当前目录，或用 `/ws add <路径>` 直接指定。');
+        const reader = await this.requireReader(target);
+        if (!reader) return;
+        projects = (await reader.listProjects()).map((project) => ({
+          id: project.id,
+          name: '',
+          directory: project.worktree,
+        }));
+        source = 'OpenCode 识别的项目';
+      }
+      if (projects.length === 0) {
+        await this.reply(target, '没有找到项目：用 `/ws add <路径>` 直接指定目录。');
         return;
       }
       const limit = command.limit === 'all' ? projects.length : Math.min(command.limit, projects.length);
       const page = projects.slice(0, limit);
-      this.lastWorkspaceList = page.map((project) => project.worktree);
+      this.lastWorkspaceList = page.map((project) => project.directory);
       const lines = [
-        `📁 **工作区**（共 ${projects.length} 个${limit < projects.length ? `，显示 ${limit} 个` : ''}）`,
+        `📁 **工作区**（${source}，共 ${projects.length} 个${limit < projects.length ? `，显示 ${limit} 个` : ''}）`,
         '',
       ];
       page.forEach((project, index) => {
-        const mark = settings.directory === project.worktree ? ' ✅' : '';
-        lines.push(`${index + 1}. \`${project.worktree}\`${mark}`);
+        const mark = settings.directory === project.directory ? ' ✅' : '';
+        const name = project.name && project.name !== project.directory ? ` · ${project.name}` : '';
+        lines.push(`${index + 1}. \`${project.directory}\`${name}${mark}`);
       });
       lines.push('', '切换：`/ws switch 序号` 或 `/ws switch 路径`');
       await this.reply(target, lines.join('\n'));
@@ -1084,6 +1088,9 @@ export class Bridge {
     let directory = '';
     if (command.action === 'switch' && /^\d+$/.test(command.target)) {
       const index = Number(command.target);
+      if (this.lastWorkspaceList.length === 0) {
+        this.lastWorkspaceList = (await readHostProjects()).map((project) => project.directory);
+      }
       directory = this.lastWorkspaceList[index - 1] ?? '';
       if (!directory) {
         await this.reply(target, `没有第 ${index} 个项目，先看 /ws list。`);

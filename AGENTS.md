@@ -25,6 +25,7 @@ tests/            bun test（含 jsdom 面板冒烟与命令例子防漂移）
 - **卡片要收口**：回合被 `/stop`、`/s new`、`/ws switch` 或服务关停打断时，用 `closeCards()` 结束卡片，别让用户一直看到转圈。回合代号（`bumpEpoch`）用来作废“建到一半”的卡片。
 - **命令语法必须与上游一致**：`service/slash.ts` 的解析规则对应 `service/catalog.ts` 里的每一条 `usage`/`examples`；`tests/slash.test.ts` 会拿目录里的每一行去解析，写了却解析不了会直接失败。OpenChamber 没有对应能力的命令才允许不提供，并写进 `HELP_FOOTER`。
 - **OpenCode 读接口的真实形状**（对着宿主 2.7.3 抓的）：项目目录在 `canonical`（不是 worktree）；会话在 `{ data: [...] }` 里，目录是 `location.directory`，归档看 `time.archived`，“正在运行”只能从 `/api/session/active` 的 `{ data: { id: { type } } }` 拿。改 `service/opencode.ts` 前先看这段，别按直觉猜字段。
+- **`/ws list` 用 OpenChamber 的项目，`/s list` 用 OpenCode 的会话**：应用里“已打开的项目”在 `~/.config/openchamber/settings.json` 的 `projects[].path`（`OPENCHAMBER_CONFIG_DIR` 可覆盖），`service/host-projects.ts` 只读它；读不到才退回 OpenCode 的 `/api/project`。会话列表来自 `/api/session`，归档看 `time.archived`；扩展读不到应用自己的“已完成”标记，所以不按它过滤（`/s list all` 与默认一致，只为兼容）。
 - **插件与服务只通过 `~/.openchamber-dingtalk` 通信**（可用 `OPENCHAMBER_DINGTALK_HOME` 覆盖）：`status.json`、`outbox/`、`results/`。插件拿不到端口和令牌，不要试图让它直连服务。
 - **UI 一律用 `@openchamber/sdk/ui`** 的 mount 函数（跟随主题）；不要自己造控件或轮询，状态靠 `host.onServiceEvent('state')` 触发刷新。
 

@@ -65,8 +65,8 @@
 | `/status [brief\|full]` | 连接、绑定、目录、各开关；`full` 加待处理请求与最近动态 |
 | `/stop` | 中断当前这一轮 |
 | `/next` | 重发被钉钉限流或发送失败而暂存的消息 |
-| `/session`、`/s` | `list` 只列正在运行的会话；`list all` 全部（含已完成，不含归档）；`list current` 当前项目里正在运行的；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
-| `/workspace`、`/ws` | `list [all\|数量]` 列出宿主登记的全部项目目录；`status` 看默认目录；`switch <编号\|路径>` 换目录；`add <路径>` 校验目录后换过去 |
+| `/session`、`/s` | `list` 未归档的会话；`list all` 同上；`list current` 当前项目的会话；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
+| `/workspace`、`/ws` | `list [all\|数量]` 列出**OpenChamber 里已打开的项目**；`status` 看默认目录；`switch <编号\|路径>` 换目录；`add <路径>` 校验目录后换过去 |
 | `/history` | 默认最近 5 轮；`list all\|数量`、`show <编号>` 看全文 |
 | `/at` | `f <路径>` 引用文件到下一条消息；`rm <编号>`、`clear`；裸 `/at` 看已引用 |
 | `/merge`、`/mg` | `on\|off\|status`；开启后停顿合并，正文末尾 `..` 继续追加、`!!` 立即提交 |
@@ -80,7 +80,11 @@
 
 **OpenChamber 没有对应能力、因此未提供的命令**：`/fork`、`/preset`、`/model`、`/reasoning`、`/perm`、`/enter`、`/steps`、`/skill`、`/flush`，以及 `/s pin|unpin`、`/notify tasks`、`/at s`。这些能力在 OpenChamber 应用里照常可用，只是钉钉侧没有对应实现；`/help` 的页脚也会说明。
 
-`/s list`、`/ws list`、`/history` 需要「读取 OpenCode 会话」的权限（安装时的那一行），并同时读取项目与会话列表。
+`/s list` 与 `/ws list` 的列表来源：
+
+- `/ws list`：**OpenChamber 里已打开的项目**（读应用自己的 `settings.json` 里的 `projects`），不是底层 OpenCode 注册的全部项目。读不到配置时退回 OpenCode 的项目列表，并在标题里注明。
+- `/s list`：OpenCode 的会话列表，**归档的会话不返回**。应用里“已完成”的标记不在扩展可读的接口里，所以不再按它过滤；`/s list all` 与默认列表一致，保留是为了兼容。
+- `/s list current`：只列当前项目目录的会话。
 
 ## 授权与提问
 - **授权**：钉钉收到「需要授权 · 动作 · 资源」，回复 **1** 允许一次，**2** 拒绝（`拒绝：原因` 会把原因带给 agent）。普通文字不算回答，照常发给 agent。

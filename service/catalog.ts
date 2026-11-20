@@ -89,9 +89,9 @@ const ENTRIES: HelpEntry[] = [
     usage: '/session list [current] [all|数量] | switch [current] <编号|会话 id> | new [标题] | status（裸 /s 看状态）',
     group: 'navigate',
     examples: [
-      { line: '/s list', note: '正在运行的会话' },
-      { line: '/s list current', note: '当前项目里正在运行的会话' },
-      { line: '/s list all', note: '全部会话（含已完成，不含归档）' },
+      { line: '/s list', note: '未归档的会话' },
+      { line: '/s list current', note: '当前项目的会话' },
+      { line: '/s list all', note: '同上（全部未归档，顺序一致）' },
       { line: '/s switch 3', note: '切换到第 3 个（编号见 /s list）' },
       { line: '/s switch current 2', note: '当前项目列表第 2 个' },
       { line: '/s new', note: '下一条消息开新会话' },
@@ -105,8 +105,8 @@ const ENTRIES: HelpEntry[] = [
     usage: '/workspace list [all|数量] | status | switch <编号|路径> | add <路径>（裸 /ws 看状态）',
     group: 'navigate',
     examples: [
-      { line: '/workspace list', note: '最近 20 个项目目录' },
-      { line: '/workspace list all', note: '全部项目目录' },
+      { line: '/workspace list', note: 'OpenChamber 里已打开的项目' },
+      { line: '/workspace list all', note: '全部已打开的项目' },
       { line: '/workspace status', note: '当前默认目录' },
       { line: '/workspace switch 2', note: '把第 2 个设为新会话目录' },
       { line: '/workspace switch D:\\projects\\my-app', note: '按路径切换' },

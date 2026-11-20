@@ -3151,8 +3151,8 @@ var QUOTA_PROVIDER_IDLE_MS = 10 * 60000;
 var SURFACE_CONTROLLERS = ["none", "agent", "user"];
 var CONTROLLERS = new Set(SURFACE_CONTROLLERS);
 // service/bridge.ts
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import path2 from "node:path";
+import { mkdir, readFile as readFile2, stat, writeFile } from "node:fs/promises";
+import path3 from "node:path";
 
 // service/catalog.ts
 var GROUPS = [
@@ -3218,9 +3218,9 @@ var ENTRIES = [
     usage: "/session list [current] [all|数量] | switch [current] <编号|会话 id> | new [标题] | status（裸 /s 看状态）",
     group: "navigate",
     examples: [
-      { line: "/s list", note: "正在运行的会话" },
-      { line: "/s list current", note: "当前项目里正在运行的会话" },
-      { line: "/s list all", note: "全部会话（含已完成，不含归档）" },
+      { line: "/s list", note: "未归档的会话" },
+      { line: "/s list current", note: "当前项目的会话" },
+      { line: "/s list all", note: "同上（全部未归档，顺序一致）" },
       { line: "/s switch 3", note: "切换到第 3 个（编号见 /s list）" },
       { line: "/s switch current 2", note: "当前项目列表第 2 个" },
       { line: "/s new", note: "下一条消息开新会话" },
@@ -3234,8 +3234,8 @@ var ENTRIES = [
     usage: "/workspace list [all|数量] | status | switch <编号|路径> | add <路径>（裸 /ws 看状态）",
     group: "navigate",
     examples: [
-      { line: "/workspace list", note: "最近 20 个项目目录" },
-      { line: "/workspace list all", note: "全部项目目录" },
+      { line: "/workspace list", note: "OpenChamber 里已打开的项目" },
+      { line: "/workspace list all", note: "全部已打开的项目" },
       { line: "/workspace status", note: "当前默认目录" },
       { line: "/workspace switch 2", note: "把第 2 个设为新会话目录" },
       { line: "/workspace switch D:\\projects\\my-app", note: "按路径切换" },
@@ -4780,6 +4780,33 @@ function parseFormAnswer(fields, text) {
   return { ok: true, values };
 }
 
+// service/host-projects.ts
+import { readFile } from "node:fs/promises";
+import os from "node:os";
+import path2 from "node:path";
+function text(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+function hostSettingsFile(env = process.env) {
+  const custom = text(env.OPENCHAMBER_CONFIG_DIR);
+  if (custom)
+    return path2.join(custom, "settings.json");
+  return path2.join(os.homedir(), ".config", "openchamber", "settings.json");
+}
+async function readHostProjects(env = process.env) {
+  try {
+    const parsed = JSON.parse(await readFile(hostSettingsFile(env), "utf8"));
+    const list = Array.isArray(parsed.projects) ? parsed.projects : [];
+    return list.map((item) => item && typeof item === "object" ? item : null).filter((item) => item !== null && !!text(item.path)).map((item) => ({
+      id: text(item.id) || text(item.path),
+      name: text(item.label) || text(item.path),
+      directory: text(item.path)
+    }));
+  } catch {
+    return [];
+  }
+}
+
 // service/slash.ts
 var DROPPED_COMMANDS = {
   fork: "按轮次分叉需要 DSH 的会话树，OpenChamber 没有这个接口。",
@@ -5124,7 +5151,7 @@ class Bridge {
     }
   }
   async sendFileTo(target, file) {
-    const resolved = path2.resolve(file);
+    const resolved = path3.resolve(file);
     let bytes;
     try {
       const info = await stat(resolved);
@@ -5132,11 +5159,11 @@ class Bridge {
         throw new Error("不是一个文件");
       if (info.size > ATTACHMENT_MAX_BYTES)
         throw new Error(`文件超过 ${Math.round(ATTACHMENT_MAX_BYTES / 1024 / 1024)} MB`);
-      bytes = await readFile(resolved);
+      bytes = await readFile2(resolved);
     } catch (error) {
       throw new Error(`读不到附件 ${file}：${errorText(error)}`);
     }
-    const name = path2.basename(resolved);
+    const name = path3.basename(resolved);
     const kind = /\.(png|jpe?g|gif|webp|bmp)$/i.test(name) ? "image" : "file";
     await sendMediaMessage(kind, bytes, name, {
       api: this.api,
@@ -5260,7 +5287,7 @@ class Bridge {
         const saved = await this.downloadToData(message.attachment);
         if (!text && this.store.settings.mediaMerge) {
           this.heldFiles.push(saved);
-          await this.store.logActivity("state", `附件暂存，等下一条文字：${path2.basename(saved)}`);
+          await this.store.logActivity("state", `附件暂存，等下一条文字：${path3.basename(saved)}`);
           return "";
         }
         files.push(saved);
@@ -5280,10 +5307,10 @@ class Bridge {
   }
   async downloadToData(attachment) {
     const downloaded = await downloadAttachment(this.api, { ...this.credentials, robotCode: this.robotCode, cardTemplateId: "" }, attachment, { robotCode: this.robotCode, maxBytes: ATTACHMENT_MAX_BYTES });
-    const dir = path2.join(this.dataDir, "uploads");
+    const dir = path3.join(this.dataDir, "uploads");
     await mkdir(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const target = path2.join(dir, `${stamp}-${downloaded.fileName}`);
+    const target = path3.join(dir, `${stamp}-${downloaded.fileName}`);
     await writeFile(target, downloaded.bytes, { mode: 384 });
     await this.store.logActivity("state", `附件已保存：${downloaded.fileName}`);
     return target;
@@ -5765,26 +5792,21 @@ ${formatHelp()}`);
       await this.reply(target, `${previous ? "已解除当前会话；" : ""}下一条消息会新建会话${command.title ? `（标题：${command.title}）` : ""}。`);
       return;
     }
-    const reader = await this.requireReader(target);
-    if (!reader)
-      return;
     if (command.action === "list") {
-      const activeOnly = command.scope !== "all";
       const directory = command.scope === "current" ? binding?.directory || this.store.settings.directory : undefined;
-      const sessions = await reader.listSessions({
-        activeOnly,
-        ...directory ? { directory } : {}
-      });
+      const reader = await this.requireReader(target);
+      if (!reader)
+        return;
+      const sessions = await reader.listSessions(directory ? { directory } : {});
       if (sessions.length === 0) {
-        await this.reply(target, activeOnly ? "现在没有正在运行的会话。`/s list all` 可以看全部（已完成的不在默认列表里，归档的也不列）。" : directory ? `\`${directory}\` 下还没有会话。` : "还没有任何会话。");
+        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : "还没有任何会话。");
         return;
       }
       const limit = command.limit === "all" ? sessions.length : Math.min(command.limit, sessions.length);
       const page = sessions.slice(0, limit);
       this.lastSessionList = page.map((session) => session.id);
-      const scopeNote = activeOnly ? directory ? "当前目录，进行中，" : "进行中，" : directory ? "当前目录，" : "";
       const lines = [
-        `\uD83D\uDDC2 **会话**（${scopeNote}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ""}）`,
+        `\uD83D\uDDC2 **会话**（${directory ? "当前目录，" : ""}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ""}）`,
         ""
       ];
       page.forEach((session, index) => {
@@ -5792,7 +5814,7 @@ ${formatHelp()}`);
         const where = session.directory ? ` · ${session.directory}` : "";
         lines.push(`${index + 1}. ${session.title}${mark}`, `   \`${session.id}\`${where} · ${relativeTime(session.updatedAt)}`);
       });
-      lines.push("", "切换：`/s switch 序号`；看全部（含已完成）：`/s list all`；只看当前项目：`/s list current`");
+      lines.push("", "切换：`/s switch 序号`；只看当前项目：`/s list current`");
       await this.reply(target, lines.join(`
 `));
       return;
@@ -5802,8 +5824,10 @@ ${formatHelp()}`);
       const index = Number(command.target);
       let source = this.lastSessionList;
       if (source.length === 0) {
-        const all = await reader.listSessions();
-        source = all.map((session) => session.id);
+        const reader = await this.requireReader(target);
+        if (!reader)
+          return;
+        source = (await reader.listSessions()).map((session) => session.id);
         this.lastSessionList = source;
       }
       sessionId = source[index - 1] ?? "";
@@ -5812,12 +5836,15 @@ ${formatHelp()}`);
         return;
       }
     }
-    const all = await reader.listSessions();
-    const found = all.find((session) => session.id === sessionId || session.id.startsWith(sessionId));
-    if (!found) {
+    const reader = await this.requireReader(target);
+    if (!reader)
+      return;
+    const session = (await reader.listSessions()).find((item) => item.id === sessionId || item.id.startsWith(sessionId));
+    if (!session) {
       await this.reply(target, `没有找到会话「${command.target}」。`);
       return;
     }
+    const found = { id: session.id, directory: session.directory, title: session.title };
     await this.closeCards("已切换会话，这张卡片结束了。");
     await this.store.setBinding({
       userId: message.senderId,
@@ -5854,24 +5881,34 @@ ${formatHelp()}`);
       return;
     }
     if (command.action === "list") {
-      const reader = await this.requireReader(target);
-      if (!reader)
-        return;
-      const projects = await reader.listProjects();
+      let projects = await readHostProjects();
+      let source = "OpenChamber 已打开的项目";
       if (projects.length === 0) {
-        await this.reply(target, "没有找到项目：`/ws status` 看当前目录，或用 `/ws add <路径>` 直接指定。");
+        const reader = await this.requireReader(target);
+        if (!reader)
+          return;
+        projects = (await reader.listProjects()).map((project) => ({
+          id: project.id,
+          name: "",
+          directory: project.worktree
+        }));
+        source = "OpenCode 识别的项目";
+      }
+      if (projects.length === 0) {
+        await this.reply(target, "没有找到项目：用 `/ws add <路径>` 直接指定目录。");
         return;
       }
       const limit = command.limit === "all" ? projects.length : Math.min(command.limit, projects.length);
       const page = projects.slice(0, limit);
-      this.lastWorkspaceList = page.map((project) => project.worktree);
+      this.lastWorkspaceList = page.map((project) => project.directory);
       const lines = [
-        `\uD83D\uDCC1 **工作区**（共 ${projects.length} 个${limit < projects.length ? `，显示 ${limit} 个` : ""}）`,
+        `\uD83D\uDCC1 **工作区**（${source}，共 ${projects.length} 个${limit < projects.length ? `，显示 ${limit} 个` : ""}）`,
         ""
       ];
       page.forEach((project, index) => {
-        const mark = settings.directory === project.worktree ? " ✅" : "";
-        lines.push(`${index + 1}. \`${project.worktree}\`${mark}`);
+        const mark = settings.directory === project.directory ? " ✅" : "";
+        const name = project.name && project.name !== project.directory ? ` · ${project.name}` : "";
+        lines.push(`${index + 1}. \`${project.directory}\`${name}${mark}`);
       });
       lines.push("", "切换：`/ws switch 序号` 或 `/ws switch 路径`");
       await this.reply(target, lines.join(`
@@ -5881,6 +5918,9 @@ ${formatHelp()}`);
     let directory = "";
     if (command.action === "switch" && /^\d+$/.test(command.target)) {
       const index = Number(command.target);
+      if (this.lastWorkspaceList.length === 0) {
+        this.lastWorkspaceList = (await readHostProjects()).map((project) => project.directory);
+      }
       directory = this.lastWorkspaceList[index - 1] ?? "";
       if (!directory) {
         await this.reply(target, `没有第 ${index} 个项目，先看 /ws list。`);
@@ -6195,18 +6235,18 @@ function errorText(error) {
 }
 
 // service/config.ts
-import { mkdir as mkdir2, readFile as readFile2, rename, writeFile as writeFile2 } from "node:fs/promises";
-import os from "node:os";
-import path3 from "node:path";
+import { mkdir as mkdir2, readFile as readFile3, rename, writeFile as writeFile2 } from "node:fs/promises";
+import os2 from "node:os";
+import path4 from "node:path";
 var ACTIVITY_MAX = 30;
 var SESSIONS_MAX = 30;
 function resolveDataDir(env = process.env) {
   const given = (env.OPENCHAMBER_SERVICE_DATA_DIR ?? "").trim();
   if (given)
     return given;
-  return path3.join(os.homedir(), ".openchamber-dingtalk");
+  return path4.join(os2.homedir(), ".openchamber-dingtalk");
 }
-function text(value) {
+function text2(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 function bool(value, fallback) {
@@ -6215,17 +6255,17 @@ function bool(value, fallback) {
 function stringList(value) {
   if (!Array.isArray(value))
     return [];
-  return [...new Set(value.map((item) => text(item)).filter(Boolean))];
+  return [...new Set(value.map((item) => text2(item)).filter(Boolean))];
 }
 function normalizeStore(value) {
   const raw = value && typeof value === "object" ? value : {};
   const settingsRaw = raw.settings && typeof raw.settings === "object" ? raw.settings : {};
   const settings = {
-    clientId: text(settingsRaw.clientId),
-    clientSecret: text(settingsRaw.clientSecret),
-    robotCode: text(settingsRaw.robotCode),
-    cardTemplateId: text(settingsRaw.cardTemplateId),
-    directory: text(settingsRaw.directory),
+    clientId: text2(settingsRaw.clientId),
+    clientSecret: text2(settingsRaw.clientSecret),
+    robotCode: text2(settingsRaw.robotCode),
+    cardTemplateId: text2(settingsRaw.cardTemplateId),
+    directory: text2(settingsRaw.directory),
     allowedUsers: stringList(settingsRaw.allowedUsers),
     enabled: bool(settingsRaw.enabled, true),
     notifyOtherSessions: bool(settingsRaw.notifyOtherSessions, false),
@@ -6238,38 +6278,38 @@ function normalizeStore(value) {
   };
   const bindingRaw = raw.binding && typeof raw.binding === "object" ? raw.binding : null;
   const bindingTarget = bindingRaw?.target && typeof bindingRaw.target === "object" ? bindingRaw.target : null;
-  const binding = bindingRaw && bindingTarget && text(bindingRaw.sessionId) && text(bindingRaw.userId) ? {
-    userId: text(bindingRaw.userId),
-    sessionId: text(bindingRaw.sessionId),
-    directory: text(bindingRaw.directory),
-    title: text(bindingRaw.title),
+  const binding = bindingRaw && bindingTarget && text2(bindingRaw.sessionId) && text2(bindingRaw.userId) ? {
+    userId: text2(bindingRaw.userId),
+    sessionId: text2(bindingRaw.sessionId),
+    directory: text2(bindingRaw.directory),
+    title: text2(bindingRaw.title),
     boundAt: Number.isFinite(bindingRaw.boundAt) ? Number(bindingRaw.boundAt) : Date.now(),
     target: {
       conversationType: bindingTarget.conversationType === "group" ? "group" : "single",
-      conversationId: text(bindingTarget.conversationId),
-      ...text(bindingTarget.messageId) ? { messageId: text(bindingTarget.messageId) } : {},
-      ...text(bindingTarget.userId) ? { userId: text(bindingTarget.userId) } : {},
-      ...text(bindingTarget.openConversationId) ? { openConversationId: text(bindingTarget.openConversationId) } : {},
-      ...text(bindingTarget.sessionWebhook) ? { sessionWebhook: text(bindingTarget.sessionWebhook) } : {},
+      conversationId: text2(bindingTarget.conversationId),
+      ...text2(bindingTarget.messageId) ? { messageId: text2(bindingTarget.messageId) } : {},
+      ...text2(bindingTarget.userId) ? { userId: text2(bindingTarget.userId) } : {},
+      ...text2(bindingTarget.openConversationId) ? { openConversationId: text2(bindingTarget.openConversationId) } : {},
+      ...text2(bindingTarget.sessionWebhook) ? { sessionWebhook: text2(bindingTarget.sessionWebhook) } : {},
       ...Number.isFinite(bindingTarget.sessionWebhookExpiresAt) ? { sessionWebhookExpiresAt: Number(bindingTarget.sessionWebhookExpiresAt) } : {}
     }
   } : null;
-  const sessions = Array.isArray(raw.sessions) ? raw.sessions.map((item) => item && typeof item === "object" ? item : null).filter((item) => item !== null && !!text(item.sessionId)).map((item) => ({
-    sessionId: text(item.sessionId),
-    title: text(item.title),
-    directory: text(item.directory),
+  const sessions = Array.isArray(raw.sessions) ? raw.sessions.map((item) => item && typeof item === "object" ? item : null).filter((item) => item !== null && !!text2(item.sessionId)).map((item) => ({
+    sessionId: text2(item.sessionId),
+    title: text2(item.title),
+    directory: text2(item.directory),
     at: Number.isFinite(item.at) ? Number(item.at) : 0
   })).slice(0, SESSIONS_MAX) : [];
-  const activity = Array.isArray(raw.activity) ? raw.activity.map((item) => item && typeof item === "object" ? item : null).filter((item) => item !== null && !!text(item.text)).map((item) => ({
+  const activity = Array.isArray(raw.activity) ? raw.activity.map((item) => item && typeof item === "object" ? item : null).filter((item) => item !== null && !!text2(item.text)).map((item) => ({
     at: Number.isFinite(item.at) ? Number(item.at) : 0,
     kind: item.kind === "in" || item.kind === "out" || item.kind === "error" ? item.kind : "state",
-    text: text(item.text).slice(0, 200)
+    text: text2(item.text).slice(0, 200)
   })).slice(-ACTIVITY_MAX) : [];
   return {
     settings,
     binding,
-    ownerUserId: text(raw.ownerUserId) || null,
-    pendingTitle: text(raw.pendingTitle) || null,
+    ownerUserId: text2(raw.ownerUserId) || null,
+    pendingTitle: text2(raw.pendingTitle) || null,
     sessions,
     activity
   };
@@ -6285,10 +6325,10 @@ class ConfigStore {
   static async open(dataDir) {
     const dir = dataDir || resolveDataDir();
     await mkdir2(dir, { recursive: true });
-    const file = path3.join(dir, "bridge.json");
+    const file = path4.join(dir, "bridge.json");
     let state;
     try {
-      state = normalizeStore(JSON.parse(await readFile2(file, "utf8")));
+      state = normalizeStore(JSON.parse(await readFile3(file, "utf8")));
     } catch (error) {
       const code = error.code;
       if (code !== "ENOENT") {
@@ -6313,11 +6353,11 @@ class ConfigStore {
   async patchSettings(patch) {
     const next = {
       ...this.state.settings,
-      ...patch.clientId !== undefined ? { clientId: text(patch.clientId) } : {},
-      ...patch.clientSecret !== undefined ? { clientSecret: text(patch.clientSecret) } : {},
-      ...patch.robotCode !== undefined ? { robotCode: text(patch.robotCode) } : {},
-      ...patch.cardTemplateId !== undefined ? { cardTemplateId: text(patch.cardTemplateId) } : {},
-      ...patch.directory !== undefined ? { directory: text(patch.directory) } : {},
+      ...patch.clientId !== undefined ? { clientId: text2(patch.clientId) } : {},
+      ...patch.clientSecret !== undefined ? { clientSecret: text2(patch.clientSecret) } : {},
+      ...patch.robotCode !== undefined ? { robotCode: text2(patch.robotCode) } : {},
+      ...patch.cardTemplateId !== undefined ? { cardTemplateId: text2(patch.cardTemplateId) } : {},
+      ...patch.directory !== undefined ? { directory: text2(patch.directory) } : {},
       ...patch.allowedUsers !== undefined ? { allowedUsers: stringList(patch.allowedUsers) } : {},
       ...patch.enabled !== undefined ? { enabled: patch.enabled } : {},
       ...patch.notifyOtherSessions !== undefined ? { notifyOtherSessions: patch.notifyOtherSessions } : {},
@@ -6341,7 +6381,7 @@ class ConfigStore {
     await this.flush();
   }
   async setPendingTitle(title) {
-    this.state = { ...this.state, pendingTitle: title ? text(title) : null };
+    this.state = { ...this.state, pendingTitle: title ? text2(title) : null };
     await this.flush();
   }
   async refreshTarget(target) {
@@ -6800,7 +6840,7 @@ class DingTalkStream {
 
 // service/opencode.ts
 var REQUEST_TIMEOUT_MS = 1e4;
-function text2(value) {
+function text3(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 function asList(value) {
@@ -6824,7 +6864,7 @@ function activeIds(value) {
       if (typeof item === "string")
         ids.add(item);
       else if (item && typeof item === "object") {
-        const id = text2(item.id) || text2(item.sessionID);
+        const id = text3(item.id) || text3(item.sessionID);
         if (id)
           ids.add(id);
       }
@@ -6835,7 +6875,7 @@ function activeIds(value) {
     for (const [id, info] of Object.entries(body)) {
       if (!id || !info || typeof info !== "object")
         continue;
-      const type = text2(info.type);
+      const type = text3(info.type);
       if (!type || type === "running")
         ids.add(id);
     }
@@ -6871,8 +6911,8 @@ function normalizeForCompare(directory) {
   return directory.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 function createOpenCodeReader(env = process.env) {
-  const baseUrl = text2(env.OPENCHAMBER_OPENCODE_URL);
-  const token = text2(env.OPENCHAMBER_SERVICE_TOKEN);
+  const baseUrl = text3(env.OPENCHAMBER_OPENCODE_URL);
+  const token = text3(env.OPENCHAMBER_SERVICE_TOKEN);
   if (!baseUrl || !token)
     return null;
   const get = async (path) => {
@@ -6902,10 +6942,10 @@ function createOpenCodeReader(env = process.env) {
     if (!item || typeof item !== "object")
       return null;
     const record = item;
-    const id = text2(record.id);
+    const id = text3(record.id);
     if (!id)
       return null;
-    if (text2(record.parentID) || text2(record.parentId))
+    if (text3(record.parentID) || text3(record.parentId))
       return null;
     const time = record.time && typeof record.time === "object" ? record.time : {};
     if (time.archived)
@@ -6914,10 +6954,10 @@ function createOpenCodeReader(env = process.env) {
     const updated = Number(time.updated ?? time.created ?? 0);
     return {
       id,
-      title: text2(record.title) || "未命名会话",
-      directory: text2(location.directory) || text2(record.directory),
+      title: text3(record.title) || "未命名会话",
+      directory: text3(location.directory) || text3(record.directory),
       updatedAt: Number.isFinite(updated) ? updated : 0,
-      outcome: text2(record.outcome)
+      outcome: text3(record.outcome)
     };
   };
   const readSessions = async (path) => {
@@ -6944,10 +6984,10 @@ function createOpenCodeReader(env = process.env) {
         if (!item || typeof item !== "object")
           continue;
         const record = item;
-        const worktree = text2(record.canonical) || text2(record.worktree) || text2(record.directory) || text2(record.path);
+        const worktree = text3(record.canonical) || text3(record.worktree) || text3(record.directory) || text3(record.path);
         if (!isUsableProject(worktree))
           continue;
-        found.set(normalizeForCompare(worktree), { id: text2(record.id) || worktree, worktree });
+        found.set(normalizeForCompare(worktree), { id: text3(record.id) || worktree, worktree });
       }
     } catch {}
     if (found.size === 0) {
@@ -6972,7 +7012,7 @@ function createOpenCodeReader(env = process.env) {
         continue;
       const record = item;
       const info = record.info && typeof record.info === "object" ? record.info : {};
-      const role = text2(info.role);
+      const role = text3(info.role);
       const at = Number(info.time?.created ?? 0);
       const body = partText(record.parts);
       if (role === "user") {
@@ -6992,25 +7032,25 @@ function createOpenCodeReader(env = process.env) {
 }
 
 // service/spool.ts
-import { mkdir as mkdir3, readFile as readFile3, readdir, rename as rename2, rm, writeFile as writeFile3 } from "node:fs/promises";
-import os2 from "node:os";
-import path4 from "node:path";
+import { mkdir as mkdir3, readFile as readFile4, readdir, rename as rename2, rm, writeFile as writeFile3 } from "node:fs/promises";
+import os3 from "node:os";
+import path5 from "node:path";
 var SPOOL_HOME_ENV = "OPENCHAMBER_DINGTALK_HOME";
 var RESULT_KEEP = 50;
 function spoolRoot(env = process.env) {
   const custom = (env[SPOOL_HOME_ENV] ?? "").trim();
   if (custom)
     return custom;
-  return path4.join(os2.homedir(), ".openchamber-dingtalk");
+  return path5.join(os3.homedir(), ".openchamber-dingtalk");
 }
 function statusFile(env = process.env) {
-  return path4.join(spoolRoot(env), "status.json");
+  return path5.join(spoolRoot(env), "status.json");
 }
 function outboxDir(env = process.env) {
-  return path4.join(spoolRoot(env), "outbox");
+  return path5.join(spoolRoot(env), "outbox");
 }
 function resultsDir(env = process.env) {
-  return path4.join(spoolRoot(env), "results");
+  return path5.join(spoolRoot(env), "results");
 }
 async function writeJsonAtomic(file, value) {
   const temp = `${file}.${process.pid}.tmp`;
@@ -7019,7 +7059,7 @@ async function writeJsonAtomic(file, value) {
 }
 async function writeBridgeStatus(status, env) {
   const file = statusFile(env);
-  await mkdir3(path4.dirname(file), { recursive: true });
+  await mkdir3(path5.dirname(file), { recursive: true });
   await writeJsonAtomic(file, status);
 }
 async function drainOutbox(env) {
@@ -7032,9 +7072,9 @@ async function drainOutbox(env) {
   }
   const entries = [];
   for (const name of names.filter((item) => item.endsWith(".json")).sort()) {
-    const file = path4.join(dir, name);
+    const file = path5.join(dir, name);
     try {
-      const raw = JSON.parse(await readFile3(file, "utf8"));
+      const raw = JSON.parse(await readFile4(file, "utf8"));
       if (!raw || typeof raw !== "object" || typeof raw.id !== "string")
         throw new Error("任务格式不对");
       entries.push({
@@ -7061,11 +7101,11 @@ async function removeOutboxJob(file) {
 async function writeOutboxResult(id, result, env) {
   const dir = resultsDir(env);
   await mkdir3(dir, { recursive: true });
-  await writeJsonAtomic(path4.join(dir, `${id}.json`), result);
+  await writeJsonAtomic(path5.join(dir, `${id}.json`), result);
   try {
     const names = (await readdir(dir)).filter((name) => name.endsWith(".json")).sort();
     for (const name of names.slice(0, Math.max(0, names.length - RESULT_KEEP))) {
-      await rm(path4.join(dir, name), { force: true }).catch(() => {
+      await rm(path5.join(dir, name), { force: true }).catch(() => {
         return;
       });
     }

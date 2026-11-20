@@ -84,6 +84,8 @@ async function setup(options: {
   sessions?: Array<{ id: string; title: string; directory: string; updatedAt: number; outcome?: string }>;
   projects?: string[];
   turns?: Array<{ user: string; reply: string; at: number }>;
+  /** 写进 OpenChamber settings.json 的“已打开项目”；`null` 表示没有配置文件。 */
+  hostProjects?: Array<{ path: string; label?: string }> | null;
 } = {}): Promise<{
   bridge: Bridge;
   store: ConfigStore;
@@ -105,6 +107,21 @@ async function setup(options: {
   const hostState = { starts: [], sends: [], answers: [] };
   const controls = { failTimes: 0 };
   const readerCalls: string[] = [];
+
+  // OpenChamber 的“已打开项目”来自配置目录的 settings.json；测试里指到临时目录。
+  const configDir = path.join(dir, 'openchamber-config');
+  await mkdir(configDir, { recursive: true });
+  const hostProjects = options.hostProjects === null
+    ? null
+    : (options.hostProjects ?? [{ path: 'D:/proj', label: 'Proj A' }, { path: 'D:/other', label: 'Proj B' }]);
+  if (hostProjects) {
+    await writeFile(
+      path.join(configDir, 'settings.json'),
+      JSON.stringify({ projects: hostProjects.map((project, index) => ({ id: `hp${index}`, path: project.path, label: project.label })) }),
+      'utf8',
+    );
+  }
+  process.env.OPENCHAMBER_CONFIG_DIR = configDir;
 
   const baseSessions = options.sessions ?? [
     { id: 'ses_live', title: '正在运行的会话', directory: 'D:/proj', updatedAt: Date.now(), outcome: 'succeeded' },
@@ -199,6 +216,7 @@ function event(
 }
 
 afterEach(async () => {
+  delete process.env.OPENCHAMBER_CONFIG_DIR;
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -288,38 +306,29 @@ describe('入站消息', () => {
     expect(store.binding?.sessionId).toBe('ses_2');
   });
 
-  test('/s list 默认只列正在运行的会话，/s list all 才列全部', async () => {
-    const { bridge, recorded, store, hostState, readerCalls } = await setup();
+  test('/s list 列出未归档的会话，/s list current 只看当前项目', async () => {
+    const { bridge, recorded, store, hostState } = await setup();
     bridge.handleInbound(callback('一'));
     await bridge.whenIdle();
 
     bridge.handleInbound(callback('/s list'));
     await bridge.whenIdle();
-    const active = lastText(recorded);
-    expect(active).toContain('正在运行的会话');
-    expect(active).toContain('进行中');
-    expect(active).not.toContain('应用里开的会话');
-    expect(readerCalls.at(-1)).toBe('sessions:active');
-
-    bridge.handleInbound(callback('/s list all'));
-    await bridge.whenIdle();
-    const all = lastText(recorded);
-    expect(all).toContain('应用里开的会话');
-    expect(all).toContain('ses_app_1');
-    expect(all).toContain('ses_app_2');
-    expect(all).toContain('共 3 个');
-    expect(readerCalls.at(-1)).toBe('sessions');
+    const list = lastText(recorded);
+    expect(list).toContain('正在运行的会话');
+    expect(list).toContain('应用里开的会话');
+    expect(list).toContain('另一个会话');
+    expect(list).toContain('共 3 个');
 
     bridge.handleInbound(callback('/s switch 2'));
     await bridge.whenIdle();
     expect(store.binding?.sessionId).toBe('ses_app_1');
 
-    bridge.handleInbound(callback('回到旧会话'));
+    bridge.handleInbound(callback('继续这个会话'));
     await bridge.whenIdle();
-    expect(hostState.sends).toEqual([{ sessionId: 'ses_app_1', prompt: '回到旧会话' }]);
+    expect(hostState.sends).toEqual([{ sessionId: 'ses_app_1', prompt: '继续这个会话' }]);
   });
 
-  test('/s list current 只看当前目录里正在运行的', async () => {
+  test('/s list current 只看当前项目的会话', async () => {
     const { bridge, recorded } = await setup();
     bridge.handleInbound(callback('一'));
     await bridge.whenIdle();
@@ -327,21 +336,9 @@ describe('入站消息', () => {
     await bridge.whenIdle();
     const listing = lastText(recorded);
     expect(listing).toContain('正在运行的会话');
+    expect(listing).toContain('应用里开的会话');
     expect(listing).toContain('当前目录');
-    expect(listing).not.toContain('应用里开的会话');
     expect(listing).not.toContain('另一个会话');
-  });
-
-  test('没有正在运行的会话时给出 /s list all 的提示', async () => {
-    const { bridge, recorded } = await setup({
-      sessions: [{ id: 'ses_done', title: '已完成的会话', directory: 'D:/proj', updatedAt: 1, outcome: 'succeeded' }],
-    });
-    bridge.handleInbound(callback('一'));
-    await bridge.whenIdle();
-    bridge.handleInbound(callback('/s list'));
-    await bridge.whenIdle();
-    expect(lastText(recorded)).toContain('现在没有正在运行的会话');
-    expect(lastText(recorded)).toContain('/s list all');
   });
 
   test('没有读取权限时说清楚去哪批准', async () => {
@@ -705,19 +702,26 @@ describe('命令：帮助与状态', () => {
 });
 
 describe('命令：工作区', () => {
-  test('/ws list 列出全部项目，/ws switch 换目录并解绑', async () => {
+  test('/ws list 只列 OpenChamber 已打开的项目，/ws switch 换目录并解绑', async () => {
     const dirA = await mkdtemp(path.join(os.tmpdir(), 'ws-a-'));
     const dirB = await mkdtemp(path.join(os.tmpdir(), 'ws-b-'));
     dirs.push(dirA, dirB);
-    const { bridge, recorded, store } = await setup({ projects: [dirA, dirB] });
+    const { bridge, recorded, store } = await setup({
+      hostProjects: [
+        { path: dirA, label: '项目 A' },
+        { path: dirB, label: '项目 B' },
+      ],
+    });
     bridge.handleInbound(callback('你好'));
     await bridge.whenIdle();
 
     bridge.handleInbound(callback('/ws list'));
     await bridge.whenIdle();
     const listing = lastText(recorded);
+    expect(listing).toContain('OpenChamber 已打开的项目');
     expect(listing).toContain(dirA);
     expect(listing).toContain(dirB);
+    expect(listing).toContain('项目 A');
     expect(listing).toContain('共 2 个');
 
     bridge.handleInbound(callback('/ws switch 2'));
@@ -725,6 +729,15 @@ describe('命令：工作区', () => {
     expect(store.settings.directory).toBe(dirB);
     expect(store.binding).toBeNull();
     expect(lastText(recorded)).toContain(dirB);
+  });
+
+  test('没有 OpenChamber 配置文件时退回 OpenCode 的项目列表', async () => {
+    const { bridge, recorded } = await setup({ hostProjects: null, projects: ['D:/proj'] });
+    bridge.handleInbound(callback('/ws list'));
+    await bridge.whenIdle();
+    const listing = lastText(recorded);
+    expect(listing).toContain('OpenCode 识别的项目');
+    expect(listing).toContain('D:/proj');
   });
 
   test('/ws add 只接受真实存在的目录', async () => {
