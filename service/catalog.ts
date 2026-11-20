@@ -89,9 +89,9 @@ const ENTRIES: HelpEntry[] = [
     usage: '/session list [current] [all|数量] | switch [current] <编号|会话 id> | new [标题] | status（裸 /s 看状态）',
     group: 'navigate',
     examples: [
-      { line: '/s list', note: '未归档的会话' },
+      { line: '/s list', note: '已打开项目里的会话（不含归档）' },
       { line: '/s list current', note: '当前项目的会话' },
-      { line: '/s list all', note: '同上（全部未归档，顺序一致）' },
+      { line: '/s list all', note: '同上（与默认一致，兼容旧语法）' },
       { line: '/s switch 3', note: '切换到第 3 个（编号见 /s list）' },
       { line: '/s switch current 2', note: '当前项目列表第 2 个' },
       { line: '/s new', note: '下一条消息开新会话' },

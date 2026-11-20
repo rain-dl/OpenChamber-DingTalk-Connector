@@ -341,6 +341,36 @@ describe('入站消息', () => {
     expect(listing).not.toContain('另一个会话');
   });
 
+  test('/s list 只列已打开项目的会话（含子目录），别处的与快捷聊天都不列', async () => {
+    const { bridge, recorded } = await setup({
+      hostProjects: [{ path: 'D:/proj', label: 'Proj' }],
+      sessions: [
+        { id: 'ses_in', title: '项目里的', directory: 'D:/proj', updatedAt: 3 },
+        { id: 'ses_sub', title: '子目录里的', directory: 'D:/proj/packages/app', updatedAt: 2 },
+        { id: 'ses_out', title: '别处的', directory: 'D:/other', updatedAt: 1 },
+        { id: 'ses_chat', title: '快捷聊天', directory: 'C:/Users/me/.config/openchamber/chats/2026-11-20/session-1', updatedAt: 4 },
+      ],
+    });
+    bridge.handleInbound(callback('/s list'));
+    await bridge.whenIdle();
+    const listing = lastText(recorded);
+    expect(listing).toContain('已打开项目');
+    expect(listing).toContain('项目里的');
+    expect(listing).toContain('子目录里的');
+    expect(listing).not.toContain('别处的');
+    expect(listing).not.toContain('快捷聊天');
+    expect(listing).toContain('共 2 个');
+  });
+
+  test('读不到 OpenChamber 项目列表时不筛会话', async () => {
+    const { bridge, recorded } = await setup({ hostProjects: null });
+    bridge.handleInbound(callback('/s list'));
+    await bridge.whenIdle();
+    const listing = lastText(recorded);
+    expect(listing).toContain('正在运行的会话');
+    expect(listing).toContain('另一个会话');
+  });
+
   test('没有读取权限时说清楚去哪批准', async () => {
     const { bridge, recorded } = await setup({ withReader: false });
     bridge.handleInbound(callback('/s list'));

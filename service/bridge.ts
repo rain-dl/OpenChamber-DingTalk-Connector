@@ -41,7 +41,7 @@ import {
   renderPermissionAsk,
   renderQuestionAsk,
 } from './format.js';
-import { readHostProjects } from './host-projects.js';
+import { isWithinProject, readHostProjects } from './host-projects.js';
 import type { OpenCodeReader } from './opencode.js';
 import { parseSlashCommand, splitMergeSuffix, DROPPED_COMMANDS, type SlashCommand } from './slash.js';
 
@@ -953,10 +953,21 @@ export class Bridge {
         : undefined;
       const reader = await this.requireReader(target);
       if (!reader) return;
-      const sessions = await reader.listSessions(directory ? { directory } : {});
+
+      // 只列 OpenChamber 里已打开项目的会话；读不到项目列表时不筛（免得列表空掉）。
+      const projects = await readHostProjects();
+      const projectScoped = projects.length > 0;
+      const sessions = (await reader.listSessions(directory ? { directory } : {})).filter(
+        (session) => !projectScoped || projects.some((project) => isWithinProject(session.directory, project.directory)),
+      );
 
       if (sessions.length === 0) {
-        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : '还没有任何会话。');
+        await this.reply(
+          target,
+          projectScoped
+            ? '已打开的项目里还没有会话（`/ws list` 看项目，`/ws add <路径>` 加目录）。'
+            : '还没有任何会话。',
+        );
         return;
       }
 
@@ -964,7 +975,7 @@ export class Bridge {
       const page = sessions.slice(0, limit);
       this.lastSessionList = page.map((session) => session.id);
       const lines = [
-        `🗂 **会话**（${directory ? '当前目录，' : ''}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
+        `🗂 **会话**（${projectScoped ? '已打开项目，' : ''}${directory ? '当前目录，' : ''}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
         '',
       ];
       page.forEach((session, index) => {

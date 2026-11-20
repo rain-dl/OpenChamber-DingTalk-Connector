@@ -65,7 +65,7 @@
 | `/status [brief\|full]` | 连接、绑定、目录、各开关；`full` 加待处理请求与最近动态 |
 | `/stop` | 中断当前这一轮 |
 | `/next` | 重发被钉钉限流或发送失败而暂存的消息 |
-| `/session`、`/s` | `list` 未归档的会话；`list all` 同上；`list current` 当前项目的会话；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
+| `/session`、`/s` | `list` 已打开项目里的会话（不含归档）；`list all` 同上；`list current` 当前项目的会话；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
 | `/workspace`、`/ws` | `list [all\|数量]` 列出**OpenChamber 里已打开的项目**；`status` 看默认目录；`switch <编号\|路径>` 换目录；`add <路径>` 校验目录后换过去 |
 | `/history` | 默认最近 5 轮；`list all\|数量`、`show <编号>` 看全文 |
 | `/at` | `f <路径>` 引用文件到下一条消息；`rm <编号>`、`clear`；裸 `/at` 看已引用 |
@@ -83,8 +83,8 @@
 `/s list` 与 `/ws list` 的列表来源：
 
 - `/ws list`：**OpenChamber 里已打开的项目**（读应用自己的 `settings.json` 里的 `projects`），不是底层 OpenCode 注册的全部项目。读不到配置时退回 OpenCode 的项目列表，并在标题里注明。
-- `/s list`：OpenCode 的会话列表，**归档的会话不返回**。应用里“已完成”的标记不在扩展可读的接口里，所以不再按它过滤；`/s list all` 与默认列表一致，保留是为了兼容。
-- `/s list current`：只列当前项目目录的会话。
+- `/s list`：**只看已打开项目的会话**——会话目录等于某个项目目录或在其子目录下才算，快捷聊天、别的目录的会话都不列；归档（`time.archived`）也不列。项目列表读不到时不筛，避免列表空掉。
+- `/s list all` 与默认一致，保留只为兼容上游语法；`/s list current` 再按当前项目目录收窄。
 
 ## 授权与提问
 - **授权**：钉钉收到「需要授权 · 动作 · 资源」，回复 **1** 允许一次，**2** 拒绝（`拒绝：原因` 会把原因带给 agent）。普通文字不算回答，照常发给 agent。

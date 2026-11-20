@@ -43,3 +43,16 @@ export async function readHostProjects(env: NodeJS.ProcessEnv = process.env): Pr
     return [];
   }
 }
+
+/** 比较用的路径：统一分隔符、去掉尾部分隔符、Windows 下大小写无关。 */
+export function normalizeDirectory(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+/** 会话目录是否属于这个项目（项目根或它下面的子目录）。 */
+export function isWithinProject(directory: string, projectDirectory: string): boolean {
+  const dir = normalizeDirectory(directory);
+  const project = normalizeDirectory(projectDirectory);
+  if (!dir || !project) return false;
+  return dir === project || dir.startsWith(`${project}/`);
+}

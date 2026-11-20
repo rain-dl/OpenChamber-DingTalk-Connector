@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { hostSettingsFile, readHostProjects } from '../service/host-projects.js';
+import { hostSettingsFile, isWithinProject, readHostProjects } from '../service/host-projects.js';
 
 const dirs: string[] = [];
 const original = process.env.OPENCHAMBER_CONFIG_DIR;
@@ -58,5 +58,27 @@ describe('OpenChamber 已打开的项目', () => {
 
   test('默认路径在用户主目录的 .config/openchamber 下', () => {
     expect(hostSettingsFile({})).toBe(path.join(os.homedir(), '.config', 'openchamber', 'settings.json'));
+  });
+});
+
+describe('项目路径匹配', () => {
+  test('项目根与子目录算同一个项目，分隔符和大小写都归一', () => {
+    expect(isWithinProject('D:\\proj', 'D:/proj')).toBe(true);
+    expect(isWithinProject('d:/PROJ/', 'D:\\proj')).toBe(true);
+    expect(isWithinProject('D:/proj/packages/app', 'D:/proj')).toBe(true);
+    expect(isWithinProject('D:\\proj\\packages\\app', 'D:\\proj')).toBe(true);
+  });
+
+  test('相邻但不同名的目录不算', () => {
+    expect(isWithinProject('D:/proj2', 'D:/proj')).toBe(false);
+    expect(isWithinProject('D:/proj-other/app', 'D:/proj')).toBe(false);
+    expect(isWithinProject('', 'D:/proj')).toBe(false);
+    expect(isWithinProject('D:/proj', '')).toBe(false);
+  });
+
+  test('快捷聊天目录不落在项目里', () => {
+    expect(isWithinProject('C:/Users/me/.config/openchamber/chats/2026-11-20/session-1', 'C:/Users/me')).toBe(true);
+    // 但如果用户没把主目录当项目，它自然不匹配
+    expect(isWithinProject('C:/Users/me/.config/openchamber/chats/2026-11-20/session-1', 'D:/proj')).toBe(false);
   });
 });
