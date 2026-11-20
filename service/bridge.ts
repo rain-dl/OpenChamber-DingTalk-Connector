@@ -950,19 +950,33 @@ export class Bridge {
     if (!reader) return;
 
     if (command.action === 'list') {
+      const activeOnly = command.scope !== 'all';
       const directory = command.scope === 'current'
         ? (binding?.directory || this.store.settings.directory)
         : undefined;
-      const sessions = await reader.listSessions(directory ? { directory } : {});
+      const sessions = await reader.listSessions({
+        activeOnly,
+        ...(directory ? { directory } : {}),
+      });
       if (sessions.length === 0) {
-        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : '还没有任何会话。');
+        await this.reply(
+          target,
+          activeOnly
+            ? '现在没有正在运行的会话。`/s list all` 可以看全部（已完成的不在默认列表里，归档的也不列）。'
+            : directory
+              ? `\`${directory}\` 下还没有会话。`
+              : '还没有任何会话。',
+        );
         return;
       }
       const limit = command.limit === 'all' ? sessions.length : Math.min(command.limit, sessions.length);
       const page = sessions.slice(0, limit);
       this.lastSessionList = page.map((session) => session.id);
+      const scopeNote = activeOnly
+        ? (directory ? '当前目录，进行中，' : '进行中，')
+        : (directory ? '当前目录，' : '');
       const lines = [
-        `🗂 **会话**（${command.scope === 'current' ? '当前目录，' : ''}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
+        `🗂 **会话**（${scopeNote}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
         '',
       ];
       page.forEach((session, index) => {
@@ -970,20 +984,20 @@ export class Bridge {
         const where = session.directory ? ` · ${session.directory}` : '';
         lines.push(`${index + 1}. ${session.title}${mark}`, `   \`${session.id}\`${where} · ${relativeTime(session.updatedAt)}`);
       });
-      lines.push('', '切换：`/s switch 序号`；只看当前目录：`/s list current`');
+      lines.push('', '切换：`/s switch 序号`；看全部（含已完成）：`/s list all`；只看当前项目：`/s list current`');
       await this.reply(target, lines.join('\n'));
       return;
     }
 
-    // switch
+    // switch：编号按最近一次 /s list 的顺序（没有就先取全部未归档的会话）。
     let sessionId = command.target;
     if (/^\d+$/.test(command.target)) {
       const index = Number(command.target);
       let source = this.lastSessionList;
-      if (command.scope === 'current' || source.length === 0) {
-        const directory = binding?.directory || this.store.settings.directory;
-        const scoped = await reader.listSessions(directory && command.scope === 'current' ? { directory } : {});
-        source = scoped.map((session) => session.id);
+      if (source.length === 0) {
+        const all = await reader.listSessions();
+        source = all.map((session) => session.id);
+        this.lastSessionList = source;
       }
       sessionId = source[index - 1] ?? '';
       if (!sessionId) {
@@ -1048,7 +1062,7 @@ export class Bridge {
       if (!reader) return;
       const projects = await reader.listProjects();
       if (projects.length === 0) {
-        await this.reply(target, '还没有任何项目。');
+        await this.reply(target, '没有找到项目：`/ws status` 看当前目录，或用 `/ws add <路径>` 直接指定。');
         return;
       }
       const limit = command.limit === 'all' ? projects.length : Math.min(command.limit, projects.length);

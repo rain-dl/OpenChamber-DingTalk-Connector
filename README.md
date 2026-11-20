@@ -65,8 +65,8 @@
 | `/status [brief\|full]` | 连接、绑定、目录、各开关；`full` 加待处理请求与最近动态 |
 | `/stop` | 中断当前这一轮 |
 | `/next` | 重发被钉钉限流或发送失败而暂存的消息 |
-| `/session`、`/s` | `list [current] [all\|数量]` 列出全部会话；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
-| `/workspace`、`/ws` | `list [all\|数量]` 列出全部项目；`status` 看默认目录；`switch <编号\|路径>` 换目录；`add <路径>` 校验目录后换过去 |
+| `/session`、`/s` | `list` 只列正在运行的会话；`list all` 全部（含已完成，不含归档）；`list current` 当前项目里正在运行的；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
+| `/workspace`、`/ws` | `list [all\|数量]` 列出宿主登记的全部项目目录；`status` 看默认目录；`switch <编号\|路径>` 换目录；`add <路径>` 校验目录后换过去 |
 | `/history` | 默认最近 5 轮；`list all\|数量`、`show <编号>` 看全文 |
 | `/at` | `f <路径>` 引用文件到下一条消息；`rm <编号>`、`clear`；裸 `/at` 看已引用 |
 | `/merge`、`/mg` | `on\|off\|status`；开启后停顿合并，正文末尾 `..` 继续追加、`!!` 立即提交 |

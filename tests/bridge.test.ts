@@ -81,7 +81,7 @@ function fakeHost(state: { starts: unknown[]; sends: unknown[]; answers: unknown
 
 async function setup(options: {
   withReader?: boolean;
-  sessions?: Array<{ id: string; title: string; directory: string; updatedAt: number }>;
+  sessions?: Array<{ id: string; title: string; directory: string; updatedAt: number; outcome?: string }>;
   projects?: string[];
   turns?: Array<{ user: string; reply: string; at: number }>;
 } = {}): Promise<{
@@ -107,8 +107,9 @@ async function setup(options: {
   const readerCalls: string[] = [];
 
   const baseSessions = options.sessions ?? [
-    { id: 'ses_app_1', title: '应用里开的会话', directory: 'D:/proj', updatedAt: Date.now() - 60_000 },
-    { id: 'ses_app_2', title: '另一个会话', directory: 'D:/other', updatedAt: Date.now() - 120_000 },
+    { id: 'ses_live', title: '正在运行的会话', directory: 'D:/proj', updatedAt: Date.now(), outcome: 'succeeded' },
+    { id: 'ses_app_1', title: '应用里开的会话', directory: 'D:/proj', updatedAt: Date.now() - 60_000, outcome: 'succeeded' },
+    { id: 'ses_app_2', title: '另一个会话', directory: 'D:/other', updatedAt: Date.now() - 120_000, outcome: 'interrupted' },
   ];
   const reader: OpenCodeReader = {
     listProjects: async () => {
@@ -116,8 +117,10 @@ async function setup(options: {
       return (options.projects ?? ['D:/proj', 'D:/other']).map((worktree, index) => ({ id: `p${index}`, worktree }));
     },
     listSessions: async (filter = {}) => {
-      readerCalls.push('sessions');
-      return baseSessions.filter((session) => !filter.directory || session.directory === filter.directory);
+      readerCalls.push(filter.activeOnly ? 'sessions:active' : 'sessions');
+      const scoped = baseSessions.filter((session) => !filter.directory || session.directory === filter.directory);
+      const withOutcome = scoped.map((session) => ({ ...session, outcome: session.outcome ?? 'succeeded' }));
+      return filter.activeOnly ? withOutcome.filter((session) => session.id === 'ses_live') : withOutcome;
     },
     listTurns: async () => {
       readerCalls.push('turns');
@@ -285,38 +288,60 @@ describe('入站消息', () => {
     expect(store.binding?.sessionId).toBe('ses_2');
   });
 
-  test('/s list 列出全部会话（含应用里开的），/s switch 切回去', async () => {
-    const { bridge, recorded, store, hostState } = await setup();
+  test('/s list 默认只列正在运行的会话，/s list all 才列全部', async () => {
+    const { bridge, recorded, store, hostState, readerCalls } = await setup();
     bridge.handleInbound(callback('一'));
     await bridge.whenIdle();
 
     bridge.handleInbound(callback('/s list'));
     await bridge.whenIdle();
-    const listing = lastText(recorded);
-    expect(listing).toContain('应用里开的会话');
-    expect(listing).toContain('ses_app_1');
-    expect(listing).toContain('ses_app_2');
-    expect(listing).toContain('共 2 个');
+    const active = lastText(recorded);
+    expect(active).toContain('正在运行的会话');
+    expect(active).toContain('进行中');
+    expect(active).not.toContain('应用里开的会话');
+    expect(readerCalls.at(-1)).toBe('sessions:active');
+
+    bridge.handleInbound(callback('/s list all'));
+    await bridge.whenIdle();
+    const all = lastText(recorded);
+    expect(all).toContain('应用里开的会话');
+    expect(all).toContain('ses_app_1');
+    expect(all).toContain('ses_app_2');
+    expect(all).toContain('共 3 个');
+    expect(readerCalls.at(-1)).toBe('sessions');
 
     bridge.handleInbound(callback('/s switch 2'));
     await bridge.whenIdle();
-    expect(store.binding?.sessionId).toBe('ses_app_2');
+    expect(store.binding?.sessionId).toBe('ses_app_1');
 
     bridge.handleInbound(callback('回到旧会话'));
     await bridge.whenIdle();
-    expect(hostState.sends).toEqual([{ sessionId: 'ses_app_2', prompt: '回到旧会话' }]);
+    expect(hostState.sends).toEqual([{ sessionId: 'ses_app_1', prompt: '回到旧会话' }]);
   });
 
-  test('/s list current 只看当前目录', async () => {
+  test('/s list current 只看当前目录里正在运行的', async () => {
     const { bridge, recorded } = await setup();
     bridge.handleInbound(callback('一'));
     await bridge.whenIdle();
     bridge.handleInbound(callback('/s list current'));
     await bridge.whenIdle();
     const listing = lastText(recorded);
-    expect(listing).toContain('ses_app_1');
-    expect(listing).not.toContain('ses_app_2');
+    expect(listing).toContain('正在运行的会话');
     expect(listing).toContain('当前目录');
+    expect(listing).not.toContain('应用里开的会话');
+    expect(listing).not.toContain('另一个会话');
+  });
+
+  test('没有正在运行的会话时给出 /s list all 的提示', async () => {
+    const { bridge, recorded } = await setup({
+      sessions: [{ id: 'ses_done', title: '已完成的会话', directory: 'D:/proj', updatedAt: 1, outcome: 'succeeded' }],
+    });
+    bridge.handleInbound(callback('一'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/s list'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('现在没有正在运行的会话');
+    expect(lastText(recorded)).toContain('/s list all');
   });
 
   test('没有读取权限时说清楚去哪批准', async () => {

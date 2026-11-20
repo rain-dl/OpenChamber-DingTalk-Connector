@@ -1,8 +1,16 @@
 /**
  * OpenCode 只读访问（`service.provides: ["opencode"]` 的授权）。
  *
- * 只做三件事：列项目、列会话、读一个会话的消息。宿主在环境变量里给地址，
- * 令牌就是服务自己的 bearer；地址缺失说明用户没批这个权限，命令要如实说明。
+ * 真实形状（对着 2.7.3 宿主里的 OpenCode 2.3.2 抓过）：
+ *
+ *   GET /api/project        → [{ id, canonical: "D:\\path", vcs, … }, …]
+ *   GET /api/session        → { data: [ { id, title, outcome, time:{updated,busy,idle,archived}, location:{directory} } ], cursor }
+ *   GET /api/session/active → { data: { "ses_…": { "type": "running" } } }
+ *   GET /api/session/:id/message → [ { info: { role, time }, parts: [ { type: "text", text } ] } ]
+ *
+ * 两个坑都来自这层形状：
+ * - 目录在 `canonical` / `location.directory`，不是 `worktree` / `directory`；
+ * - “正在运行”是 active 接口的 id 表，会话本身没有 running 字段。
  */
 
 export type OcProject = { id: string; worktree: string };
@@ -12,6 +20,7 @@ export type OcSession = {
   title: string;
   directory: string;
   updatedAt: number;
+  outcome: string;
 };
 
 export type OcTurn = {
@@ -22,9 +31,15 @@ export type OcTurn = {
   at: number;
 };
 
+export type ListSessionsOptions = {
+  directory?: string;
+  /** 只列正在运行的会话（`/api/session/active`）。 */
+  activeOnly?: boolean;
+};
+
 export type OpenCodeReader = {
   listProjects(): Promise<OcProject[]>;
-  listSessions(options?: { directory?: string }): Promise<OcSession[]>;
+  listSessions(options?: ListSessionsOptions): Promise<OcSession[]>;
   listTurns(sessionId: string): Promise<OcTurn[]>;
 };
 
@@ -34,7 +49,8 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function asArray(value: unknown): unknown[] {
+/** 接口可能给数组，也可能包一层 `{ data: [...] }`。 */
+function asList(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
   if (value && typeof value === 'object') {
     const record = value as Record<string, unknown>;
@@ -43,6 +59,31 @@ function asArray(value: unknown): unknown[] {
     }
   }
   return [];
+}
+
+/** `/api/session/active` 的 `{ data: { id: {...} } }` → id 集合。 */
+function activeIds(value: unknown): Set<string> {
+  const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  const body = record.data ?? record;
+  const ids = new Set<string>();
+  if (Array.isArray(body)) {
+    for (const item of body) {
+      if (typeof item === 'string') ids.add(item);
+      else if (item && typeof item === 'object') {
+        const id = text((item as Record<string, unknown>).id) || text((item as Record<string, unknown>).sessionID);
+        if (id) ids.add(id);
+      }
+    }
+    return ids;
+  }
+  if (body && typeof body === 'object') {
+    for (const [id, info] of Object.entries(body as Record<string, unknown>)) {
+      if (!id || !info || typeof info !== 'object') continue;
+      const type = text((info as Record<string, unknown>).type);
+      if (!type || type === 'running') ids.add(id);
+    }
+  }
+  return ids;
 }
 
 function partText(parts: unknown): string {
@@ -56,6 +97,22 @@ function partText(parts: unknown): string {
     }
   }
   return chunks.join('\n\n').trim();
+}
+
+/** 快捷聊天目录（`…/openchamber/chats/<日期>/session-…`）不是项目。 */
+function isChatDirectory(directory: string): boolean {
+  return /(^|[\\/])openchamber[\\/]chats([\\/]|$)/i.test(directory);
+}
+
+/** 去掉明显不是项目根的路径：全局项目 `/`、空串。 */
+function isUsableProject(directory: string): boolean {
+  const body = directory.trim();
+  if (!body || body === '/' || body === '\\') return false;
+  return !isChatDirectory(body);
+}
+
+function normalizeForCompare(directory: string): string {
+  return directory.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
 export function createOpenCodeReader(env: NodeJS.ProcessEnv = process.env): OpenCodeReader | null {
@@ -86,45 +143,85 @@ export function createOpenCodeReader(env: NodeJS.ProcessEnv = process.env): Open
     }
   };
 
-  const listProjects = async (): Promise<OcProject[]> => {
-    const raw = asArray(await get('/api/project'));
-    const projects: OcProject[] = [];
-    for (const item of raw) {
-      if (!item || typeof item !== 'object') continue;
-      const record = item as Record<string, unknown>;
-      const worktree = text(record.worktree) || text(record.directory) || text(record.path);
-      if (!worktree) continue;
-      projects.push({ id: text(record.id) || worktree, worktree });
-    }
-    return projects.sort((a, b) => a.worktree.localeCompare(b.worktree));
+  const parseSession = (item: unknown): OcSession | null => {
+    if (!item || typeof item !== 'object') return null;
+    const record = item as Record<string, unknown>;
+    const id = text(record.id);
+    if (!id) return null;
+    // 子会话（subagent）不是用户能切过去的对话。
+    if (text(record.parentID) || text(record.parentId)) return null;
+    const time = (record.time && typeof record.time === 'object' ? record.time : {}) as Record<string, unknown>;
+    // 归档的会话不返回：列表是用来继续对话的。
+    if (time.archived) return null;
+    const location = (record.location && typeof record.location === 'object' ? record.location : {}) as Record<string, unknown>;
+    const updated = Number(time.updated ?? time.created ?? 0);
+    return {
+      id,
+      title: text(record.title) || '未命名会话',
+      directory: text(location.directory) || text(record.directory),
+      updatedAt: Number.isFinite(updated) ? updated : 0,
+      outcome: text(record.outcome),
+    };
   };
 
-  const listSessions = async (options: { directory?: string } = {}): Promise<OcSession[]> => {
-    const raw = asArray(await get('/api/session'));
-    const sessions: OcSession[] = [];
-    for (const item of raw) {
-      if (!item || typeof item !== 'object') continue;
-      const record = item as Record<string, unknown>;
-      const id = text(record.id);
-      if (!id) continue;
-      // 子会话（subagent）不是用户能切过去的对话。
-      if (text(record.parentID) || text(record.parentId)) continue;
-      const directory = text(record.directory);
-      if (options.directory && directory && directory !== options.directory) continue;
-      const time = (record.time && typeof record.time === 'object' ? record.time : {}) as Record<string, unknown>;
-      const updated = Number(time.updated ?? time.created ?? 0);
-      sessions.push({
-        id,
-        title: text(record.title) || '未命名会话',
-        directory,
-        updatedAt: Number.isFinite(updated) ? updated : 0,
-      });
+  const readSessions = async (path: string): Promise<OcSession[]> => {
+    const raw = asList(await get(path));
+    return raw
+      .map(parseSession)
+      .filter((session): session is OcSession => session !== null)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  };
+
+  const listSessions = async (options: ListSessionsOptions = {}): Promise<OcSession[]> => {
+    if (options.activeOnly) {
+      // “正在运行”只有 id 表，标题和时间要从会话列表里补。
+      const running = activeIds(await get('/api/session/active'));
+      if (running.size === 0) return [];
+      const all = await readSessions('/api/session');
+      return all.filter((session) => running.has(session.id));
     }
-    return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+    const sessions = await readSessions('/api/session');
+    if (!options.directory) return sessions;
+    return sessions.filter((session) => !session.directory || session.directory === options.directory);
+  };
+
+  /**
+   * 项目列表：`/api/project` 优先，再用会话目录兜底。
+   * 2.7.3 宿主里目录字段叫 `canonical`，早期实现叫 worktree，
+   * 所以这里按 canonical → worktree → directory → path 依次取。
+   */
+  const listProjects = async (): Promise<OcProject[]> => {
+    const found = new Map<string, OcProject>();
+
+    try {
+      for (const item of asList(await get('/api/project'))) {
+        if (!item || typeof item !== 'object') continue;
+        const record = item as Record<string, unknown>;
+        const worktree = text(record.canonical) || text(record.worktree) || text(record.directory) || text(record.path);
+        if (!isUsableProject(worktree)) continue;
+        found.set(normalizeForCompare(worktree), { id: text(record.id) || worktree, worktree });
+      }
+    } catch {
+      // 项目接口不可用时仍然用会话目录兜底，不让 /ws list 变成空的。
+    }
+
+    if (found.size === 0) {
+      try {
+        for (const session of await readSessions('/api/session')) {
+          if (!isUsableProject(session.directory)) continue;
+          const key = normalizeForCompare(session.directory);
+          if (!found.has(key)) found.set(key, { id: session.directory, worktree: session.directory });
+        }
+      } catch {
+        // 两边都读不到就返回空，由命令层解释。
+      }
+    }
+
+    return [...found.values()].sort((a, b) => a.worktree.localeCompare(b.worktree));
   };
 
   const listTurns = async (sessionId: string): Promise<OcTurn[]> => {
-    const raw = asArray(await get(`/api/session/${encodeURIComponent(sessionId)}/message`));
+    const raw = asList(await get(`/api/session/${encodeURIComponent(sessionId)}/message`));
     const turns: OcTurn[] = [];
     let current: OcTurn | null = null;
     for (const item of raw) {

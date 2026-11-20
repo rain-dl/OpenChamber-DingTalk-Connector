@@ -132,7 +132,7 @@ export function parseSlashCommand(raw: string): SlashCommand | null {
           return { kind: 'session', action: 'list', scope: 'current', limit: parseCount(args[2], DEFAULT_LIST) };
         }
         if (scope === 'all') return { kind: 'session', action: 'list', scope: 'all', limit: 'all' };
-        if (!scope) return { kind: 'session', action: 'list', scope: 'all', limit: DEFAULT_LIST };
+        if (!scope) return { kind: 'session', action: 'list', scope: 'recent', limit: DEFAULT_LIST };
         return { kind: 'session', action: 'list', scope: 'all', limit: parseCount(scope, DEFAULT_LIST) };
       }
       if (action === 'switch') {

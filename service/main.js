@@ -3218,9 +3218,9 @@ var ENTRIES = [
     usage: "/session list [current] [all|数量] | switch [current] <编号|会话 id> | new [标题] | status（裸 /s 看状态）",
     group: "navigate",
     examples: [
-      { line: "/s list", note: "最近 20 个会话（含应用里开的）" },
-      { line: "/s list current", note: "仅当前项目目录的会话" },
-      { line: "/s list all", note: "全部会话" },
+      { line: "/s list", note: "正在运行的会话" },
+      { line: "/s list current", note: "当前项目里正在运行的会话" },
+      { line: "/s list all", note: "全部会话（含已完成，不含归档）" },
       { line: "/s switch 3", note: "切换到第 3 个（编号见 /s list）" },
       { line: "/s switch current 2", note: "当前项目列表第 2 个" },
       { line: "/s new", note: "下一条消息开新会话" },
@@ -4875,7 +4875,7 @@ function parseSlashCommand(raw) {
         if (scope === "all")
           return { kind: "session", action: "list", scope: "all", limit: "all" };
         if (!scope)
-          return { kind: "session", action: "list", scope: "all", limit: DEFAULT_LIST };
+          return { kind: "session", action: "list", scope: "recent", limit: DEFAULT_LIST };
         return { kind: "session", action: "list", scope: "all", limit: parseCount(scope, DEFAULT_LIST) };
       }
       if (action === "switch") {
@@ -5769,17 +5769,22 @@ ${formatHelp()}`);
     if (!reader)
       return;
     if (command.action === "list") {
+      const activeOnly = command.scope !== "all";
       const directory = command.scope === "current" ? binding?.directory || this.store.settings.directory : undefined;
-      const sessions = await reader.listSessions(directory ? { directory } : {});
+      const sessions = await reader.listSessions({
+        activeOnly,
+        ...directory ? { directory } : {}
+      });
       if (sessions.length === 0) {
-        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : "还没有任何会话。");
+        await this.reply(target, activeOnly ? "现在没有正在运行的会话。`/s list all` 可以看全部（已完成的不在默认列表里，归档的也不列）。" : directory ? `\`${directory}\` 下还没有会话。` : "还没有任何会话。");
         return;
       }
       const limit = command.limit === "all" ? sessions.length : Math.min(command.limit, sessions.length);
       const page = sessions.slice(0, limit);
       this.lastSessionList = page.map((session) => session.id);
+      const scopeNote = activeOnly ? directory ? "当前目录，进行中，" : "进行中，" : directory ? "当前目录，" : "";
       const lines = [
-        `\uD83D\uDDC2 **会话**（${command.scope === "current" ? "当前目录，" : ""}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ""}）`,
+        `\uD83D\uDDC2 **会话**（${scopeNote}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ""}）`,
         ""
       ];
       page.forEach((session, index) => {
@@ -5787,7 +5792,7 @@ ${formatHelp()}`);
         const where = session.directory ? ` · ${session.directory}` : "";
         lines.push(`${index + 1}. ${session.title}${mark}`, `   \`${session.id}\`${where} · ${relativeTime(session.updatedAt)}`);
       });
-      lines.push("", "切换：`/s switch 序号`；只看当前目录：`/s list current`");
+      lines.push("", "切换：`/s switch 序号`；看全部（含已完成）：`/s list all`；只看当前项目：`/s list current`");
       await this.reply(target, lines.join(`
 `));
       return;
@@ -5796,10 +5801,10 @@ ${formatHelp()}`);
     if (/^\d+$/.test(command.target)) {
       const index = Number(command.target);
       let source = this.lastSessionList;
-      if (command.scope === "current" || source.length === 0) {
-        const directory = binding?.directory || this.store.settings.directory;
-        const scoped = await reader.listSessions(directory && command.scope === "current" ? { directory } : {});
-        source = scoped.map((session) => session.id);
+      if (source.length === 0) {
+        const all = await reader.listSessions();
+        source = all.map((session) => session.id);
+        this.lastSessionList = source;
       }
       sessionId = source[index - 1] ?? "";
       if (!sessionId) {
@@ -5854,7 +5859,7 @@ ${formatHelp()}`);
         return;
       const projects = await reader.listProjects();
       if (projects.length === 0) {
-        await this.reply(target, "还没有任何项目。");
+        await this.reply(target, "没有找到项目：`/ws status` 看当前目录，或用 `/ws add <路径>` 直接指定。");
         return;
       }
       const limit = command.limit === "all" ? projects.length : Math.min(command.limit, projects.length);
@@ -6798,7 +6803,7 @@ var REQUEST_TIMEOUT_MS = 1e4;
 function text2(value) {
   return typeof value === "string" ? value.trim() : "";
 }
-function asArray(value) {
+function asList(value) {
   if (Array.isArray(value))
     return value;
   if (value && typeof value === "object") {
@@ -6809,6 +6814,33 @@ function asArray(value) {
     }
   }
   return [];
+}
+function activeIds(value) {
+  const record = value && typeof value === "object" ? value : {};
+  const body = record.data ?? record;
+  const ids = new Set;
+  if (Array.isArray(body)) {
+    for (const item of body) {
+      if (typeof item === "string")
+        ids.add(item);
+      else if (item && typeof item === "object") {
+        const id = text2(item.id) || text2(item.sessionID);
+        if (id)
+          ids.add(id);
+      }
+    }
+    return ids;
+  }
+  if (body && typeof body === "object") {
+    for (const [id, info] of Object.entries(body)) {
+      if (!id || !info || typeof info !== "object")
+        continue;
+      const type = text2(info.type);
+      if (!type || type === "running")
+        ids.add(id);
+    }
+  }
+  return ids;
 }
 function partText(parts) {
   if (!Array.isArray(parts))
@@ -6825,6 +6857,18 @@ function partText(parts) {
   return chunks.join(`
 
 `).trim();
+}
+function isChatDirectory(directory) {
+  return /(^|[\\/])openchamber[\\/]chats([\\/]|$)/i.test(directory);
+}
+function isUsableProject(directory) {
+  const body = directory.trim();
+  if (!body || body === "/" || body === "\\")
+    return false;
+  return !isChatDirectory(body);
+}
+function normalizeForCompare(directory) {
+  return directory.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 function createOpenCodeReader(env = process.env) {
   const baseUrl = text2(env.OPENCHAMBER_OPENCODE_URL);
@@ -6854,48 +6898,73 @@ function createOpenCodeReader(env = process.env) {
       clearTimeout(timer);
     }
   };
-  const listProjects = async () => {
-    const raw = asArray(await get("/api/project"));
-    const projects = [];
-    for (const item of raw) {
-      if (!item || typeof item !== "object")
-        continue;
-      const record = item;
-      const worktree = text2(record.worktree) || text2(record.directory) || text2(record.path);
-      if (!worktree)
-        continue;
-      projects.push({ id: text2(record.id) || worktree, worktree });
-    }
-    return projects.sort((a, b) => a.worktree.localeCompare(b.worktree));
+  const parseSession = (item) => {
+    if (!item || typeof item !== "object")
+      return null;
+    const record = item;
+    const id = text2(record.id);
+    if (!id)
+      return null;
+    if (text2(record.parentID) || text2(record.parentId))
+      return null;
+    const time = record.time && typeof record.time === "object" ? record.time : {};
+    if (time.archived)
+      return null;
+    const location = record.location && typeof record.location === "object" ? record.location : {};
+    const updated = Number(time.updated ?? time.created ?? 0);
+    return {
+      id,
+      title: text2(record.title) || "未命名会话",
+      directory: text2(location.directory) || text2(record.directory),
+      updatedAt: Number.isFinite(updated) ? updated : 0,
+      outcome: text2(record.outcome)
+    };
+  };
+  const readSessions = async (path) => {
+    const raw = asList(await get(path));
+    return raw.map(parseSession).filter((session) => session !== null).sort((a, b) => b.updatedAt - a.updatedAt);
   };
   const listSessions = async (options = {}) => {
-    const raw = asArray(await get("/api/session"));
-    const sessions = [];
-    for (const item of raw) {
-      if (!item || typeof item !== "object")
-        continue;
-      const record = item;
-      const id = text2(record.id);
-      if (!id)
-        continue;
-      if (text2(record.parentID) || text2(record.parentId))
-        continue;
-      const directory = text2(record.directory);
-      if (options.directory && directory && directory !== options.directory)
-        continue;
-      const time = record.time && typeof record.time === "object" ? record.time : {};
-      const updated = Number(time.updated ?? time.created ?? 0);
-      sessions.push({
-        id,
-        title: text2(record.title) || "未命名会话",
-        directory,
-        updatedAt: Number.isFinite(updated) ? updated : 0
-      });
+    if (options.activeOnly) {
+      const running = activeIds(await get("/api/session/active"));
+      if (running.size === 0)
+        return [];
+      const all = await readSessions("/api/session");
+      return all.filter((session) => running.has(session.id));
     }
-    return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+    const sessions = await readSessions("/api/session");
+    if (!options.directory)
+      return sessions;
+    return sessions.filter((session) => !session.directory || session.directory === options.directory);
+  };
+  const listProjects = async () => {
+    const found = new Map;
+    try {
+      for (const item of asList(await get("/api/project"))) {
+        if (!item || typeof item !== "object")
+          continue;
+        const record = item;
+        const worktree = text2(record.canonical) || text2(record.worktree) || text2(record.directory) || text2(record.path);
+        if (!isUsableProject(worktree))
+          continue;
+        found.set(normalizeForCompare(worktree), { id: text2(record.id) || worktree, worktree });
+      }
+    } catch {}
+    if (found.size === 0) {
+      try {
+        for (const session of await readSessions("/api/session")) {
+          if (!isUsableProject(session.directory))
+            continue;
+          const key = normalizeForCompare(session.directory);
+          if (!found.has(key))
+            found.set(key, { id: session.directory, worktree: session.directory });
+        }
+      } catch {}
+    }
+    return [...found.values()].sort((a, b) => a.worktree.localeCompare(b.worktree));
   };
   const listTurns = async (sessionId) => {
-    const raw = asArray(await get(`/api/session/${encodeURIComponent(sessionId)}/message`));
+    const raw = asList(await get(`/api/session/${encodeURIComponent(sessionId)}/message`));
     const turns = [];
     let current = null;
     for (const item of raw) {

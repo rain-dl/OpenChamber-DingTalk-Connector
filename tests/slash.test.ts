@@ -44,7 +44,7 @@ describe('命令与别名', () => {
 
   test('session：list / switch / new / status', () => {
     expect(parseSlashCommand('/s')).toEqual({ kind: 'session', action: 'status' });
-    expect(parseSlashCommand('/session list')).toEqual({ kind: 'session', action: 'list', scope: 'all', limit: 20 });
+    expect(parseSlashCommand('/session list')).toEqual({ kind: 'session', action: 'list', scope: 'recent', limit: 20 });
     expect(parseSlashCommand('/s list current')).toEqual({ kind: 'session', action: 'list', scope: 'current', limit: 20 });
     expect(parseSlashCommand('/s list all')).toEqual({ kind: 'session', action: 'list', scope: 'all', limit: 'all' });
     expect(parseSlashCommand('/s list 5')).toEqual({ kind: 'session', action: 'list', scope: 'all', limit: 5 });
