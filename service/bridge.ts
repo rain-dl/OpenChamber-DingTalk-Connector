@@ -20,6 +20,7 @@ import type {
   ServiceHost,
 } from '@openchamber/sdk';
 
+import { findHelpEntry, formatHelp, helpTopic } from './catalog.js';
 import type { Binding, ConfigStore } from './config.js';
 import { createDingTalkApi, type DingTalkApi } from './dingtalk/api.js';
 import { DingTalkCardStream } from './dingtalk/card.js';
@@ -29,6 +30,7 @@ import {
   normalizeRobotCallback,
   REACTION_DONE_NAME,
   REACTION_THINKING_NAME,
+  type InboundAttachment,
   type InboundMessage,
   type ReplyTarget,
   type RobotCallback,
@@ -39,6 +41,8 @@ import {
   renderPermissionAsk,
   renderQuestionAsk,
 } from './format.js';
+import type { OpenCodeReader } from './opencode.js';
+import { parseSlashCommand, splitMergeSuffix, DROPPED_COMMANDS, type SlashCommand } from './slash.js';
 
 const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
 const REFUSAL_COOLDOWN_MS = 5 * 60_000;
@@ -47,6 +51,17 @@ const CARD_PLACEHOLDER = '⏳ 正在处理…';
 const TEXT_CHUNK_CHARS = 3_500;
 /** 卡片放不下的回复改成文本，避免被钉钉静默截断。 */
 const CARD_MAX_CHARS = 6_000;
+/** `/merge on` 的静默窗口。 */
+const MERGE_WINDOW_MS = 1_500;
+const MERGE_MAX_PARTS = 10;
+/** `/next` 的暂存上限。 */
+const RETRY_MAX = 5;
+/** `/surface on` 注入的渠道说明：短，且每句都是 agent 能照做的。 */
+const SURFACE_TEXT = [
+  '用户是通过钉钉和你对话的，回复会原样显示在钉钉聊天里。',
+  '请用简短的 Markdown：少用表格，不要依赖按钮、图片预览或需要鼠标的操作。',
+  '需要用户决定时直接问，他会在钉钉里回复，结果会转达给你。',
+].join('\n');
 
 type Pending =
   | { kind: 'permission'; at: number; sessionId: string; requestId: string }
@@ -63,6 +78,8 @@ export type BridgeDeps = {
   onStateChange: () => void;
   /** 测试注入点：替换真实的钉钉 API 客户端。 */
   api?: DingTalkApi;
+  /** 只读的会话/项目来源；没批准 `opencode` 角色时为 null。 */
+  opencode?: OpenCodeReader | null;
 };
 
 export class Bridge {
@@ -72,6 +89,7 @@ export class Bridge {
   private readonly log: (message: string) => void;
   private readonly onStateChange: () => void;
   private readonly api: DingTalkApi;
+  private readonly opencode: OpenCodeReader | null;
   private readonly pendings: Pending[] = [];
   private readonly cards = new Map<string, CardSlot>();
   private readonly refusals = new Map<string, number>();
@@ -79,6 +97,18 @@ export class Bridge {
   private tail: Promise<void> = Promise.resolve();
   /** 每个会话的回合代号：收尾时加一，正在建的卡片就会作废。 */
   private readonly epochs = new Map<string, number>();
+  /** `/s list` 与 `/ws list` 最近一次的顺序，`switch 序号` 据此解析。 */
+  private lastSessionList: string[] = [];
+  private lastWorkspaceList: string[] = [];
+  /** `/at f` 攒下的文件引用，随下一条消息发出。 */
+  private refs: string[] = [];
+  /** `/merge on` 的缓冲。 */
+  private mergeParts: string[] = [];
+  private mergeTimer: NodeJS.Timeout | null = null;
+  /** `/media on` 暂存的附件。 */
+  private heldFiles: string[] = [];
+  /** 发送失败、等 `/next` 重发的消息。 */
+  private retryQueue: Array<{ target: ReplyTarget; text: string; at: number }> = [];
 
   constructor(deps: BridgeDeps) {
     this.store = deps.store;
@@ -87,6 +117,7 @@ export class Bridge {
     this.log = deps.log;
     this.onStateChange = deps.onStateChange;
     this.api = deps.api ?? createDingTalkApi({ logger: console });
+    this.opencode = deps.opencode ?? null;
   }
 
   /** 等排在队列里的入站消息都处理完（关停与测试用）。 */
@@ -160,6 +191,8 @@ export class Bridge {
     } catch (error) {
       await this.store.logActivity('error', `回复失败：${errorText(error)}`);
       this.log(`回复钉钉失败：${errorText(error)}`);
+      // 限流或网络抖动时留着，`/next` 可以重发。
+      this.enqueueRetry(target, text);
     }
   }
 
@@ -255,9 +288,27 @@ export class Bridge {
       this.onStateChange();
     }
 
-    const text = message.text?.trim() ?? '';
+    let text = message.text?.trim() ?? '';
     await this.store.logActivity('in', text ? `${message.senderNick ?? message.senderId}: ${text}` : `${message.senderNick ?? message.senderId} 发来附件`);
     void this.react(REACTION_THINKING_NAME, message.target.messageId);
+
+    // 1. `/raw` 透传：连命令都不拦，只有 /raw 自己例外（否则关不掉）。
+    if (settings.rawMode || settings.rawOnce) {
+      if (!/^\/raw(?:\s|$)/i.test(text)) {
+        if (settings.rawOnce && !settings.rawMode) await this.store.patchSettings({ rawOnce: false });
+        const rawPrompt = await this.buildPrompt(message, text);
+        if (rawPrompt) await this.deliver(message.target, senderOf(message), rawPrompt);
+        return;
+      }
+    }
+
+    // 2. `/merge on` 时正文末尾的 `..` / `!!`（命令不参与）。
+    let mergeMode: 'append' | 'submit' | 'auto' = 'auto';
+    if (settings.merge && text && !text.startsWith('/')) {
+      const split = splitMergeSuffix(text);
+      text = split.text;
+      mergeMode = split.mode;
+    }
 
     if (text.startsWith('/')) {
       const handled = await this.handleCommand(message, text);
@@ -270,12 +321,26 @@ export class Bridge {
       if (answered) return;
     }
 
-    const prompt = await this.buildPrompt(message);
+    const prompt = await this.buildPrompt(message, text);
     if (!prompt) {
+      // 附件被 `/media on` 暂存了，等文字；否则是真的没内容。
+      if (this.heldFiles.length > 0) return;
       await this.reply(message.target, '这条消息里没有可以转给 agent 的内容。');
       return;
     }
-    await this.deliver(message, prompt);
+
+    if (this.store.settings.merge) {
+      this.mergeParts.push(prompt);
+      if (mergeMode === 'submit' || this.mergeParts.length >= MERGE_MAX_PARTS) {
+        await this.flushMerge(message.target, senderOf(message));
+        return;
+      }
+      if (mergeMode === 'append') return; // 等 `!!` 或 /merge off
+      this.scheduleMergeFlush(message.target, senderOf(message));
+      return;
+    }
+
+    await this.deliver(message.target, senderOf(message), prompt);
   }
 
   private allowed(senderId: string): boolean {
@@ -296,39 +361,62 @@ export class Bridge {
     );
   }
 
-  /** 图片/文件先落到本机，prompt 里给出绝对路径。 */
-  private async buildPrompt(message: InboundMessage): Promise<string> {
-    const lines: string[] = [];
-    const text = message.text?.trim() ?? '';
-    if (text) lines.push(text);
+  /** 图片/文件先落到本机，prompt 里给出绝对路径；`/media on` 时先攒着。 */
+  private async buildPrompt(message: InboundMessage, text: string): Promise<string> {
+    const parts: string[] = [];
+    if (text) parts.push(text);
 
+    const files: string[] = [];
     if (message.attachment) {
       try {
-        const downloaded = await downloadAttachment(this.api, { ...this.credentials, robotCode: this.robotCode, cardTemplateId: '' }, message.attachment, {
-          robotCode: this.robotCode,
-          maxBytes: ATTACHMENT_MAX_BYTES,
-        });
-        const dir = path.join(this.dataDir, 'uploads');
-        await mkdir(dir, { recursive: true });
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const target = path.join(dir, `${stamp}-${downloaded.fileName}`);
-        await writeFile(target, downloaded.bytes, { mode: 0o600 });
-        lines.push(
-          lines.length > 0 ? '' : '钉钉发来一个附件，已保存到本机：',
-          `附件路径：${target}`,
-          '需要时请直接读取这个文件。',
-        );
-        await this.store.logActivity('state', `附件已保存：${downloaded.fileName}`);
+        const saved = await this.downloadToData(message.attachment);
+        if (!text && this.store.settings.mediaMerge) {
+          this.heldFiles.push(saved);
+          await this.store.logActivity('state', `附件暂存，等下一条文字：${path.basename(saved)}`);
+          return '';
+        }
+        files.push(saved);
       } catch (error) {
-        lines.push(`（有一个钉钉附件没能下载：${errorText(error)}）`);
+        parts.push(`（有一个钉钉附件没能下载：${errorText(error)}）`);
       }
     }
 
-    return lines.join('\n').trim();
+    const outgoing = [...this.heldFiles.splice(0), ...files];
+    if (outgoing.length > 0) parts.push(this.fileLines(outgoing));
+    if (this.refs.length > 0) {
+      parts.push(refLines(this.refs));
+      this.refs = [];
+    }
+
+    return parts.join('\n').trim();
+  }
+
+  private async downloadToData(attachment: InboundAttachment): Promise<string> {
+    const downloaded = await downloadAttachment(
+      this.api,
+      { ...this.credentials, robotCode: this.robotCode, cardTemplateId: '' },
+      attachment,
+      { robotCode: this.robotCode, maxBytes: ATTACHMENT_MAX_BYTES },
+    );
+    const dir = path.join(this.dataDir, 'uploads');
+    await mkdir(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const target = path.join(dir, `${stamp}-${downloaded.fileName}`);
+    await writeFile(target, downloaded.bytes, { mode: 0o600 });
+    await this.store.logActivity('state', `附件已保存：${downloaded.fileName}`);
+    return target;
+  }
+
+  /** `/media at|path` 决定附件在 prompt 里的写法；两种都只是指针，不内联内容。 */
+  private fileLines(files: string[]): string {
+    const style = this.store.settings.mediaRef;
+    const header = files.length > 1 ? '钉钉附件已保存到本机：' : '钉钉发来一个附件，已保存到本机：';
+    const lines = files.map((file) => (style === 'at' ? `@${file}` : `附件路径：${file}`));
+    return [header, ...lines, '需要时请直接读取这个文件。'].join('\n');
   }
 
   /** 找到（或新建）会话并把 prompt 发过去。 */
-  private async deliver(message: InboundMessage, prompt: string): Promise<void> {
+  private async deliver(target: ReplyTarget, sender: { id: string; nick?: string }, prompt: string): Promise<void> {
     const binding = this.store.binding;
     if (binding && binding.sessionId) {
       try {
@@ -340,7 +428,7 @@ export class Bridge {
         if (!gone) {
           await this.reply(
             binding.target,
-            `没能把消息送到 OpenChamber：${errorText(error)}\n回复 /new 可以开一个新会话。`,
+            `没能把消息送到 OpenChamber：${errorText(error)}\n回复 /s new 可以开一个新会话。`,
           );
           return;
         }
@@ -348,27 +436,27 @@ export class Bridge {
         this.onStateChange();
       }
     }
-    await this.startSession(message, prompt);
+    await this.startSession(target, sender, prompt);
   }
 
-  private async startSession(message: InboundMessage, prompt: string): Promise<void> {
+  private async startSession(target: ReplyTarget, sender: { id: string; nick?: string }, prompt: string): Promise<void> {
     const directory = this.store.settings.directory;
     if (!directory) {
       await this.reply(
-        message.target,
+        target,
         '还差一步：在 OpenChamber 的「钉钉桥接」面板里选择默认项目目录，下一条消息就会开一个新会话。',
       );
       return;
     }
-    const title = this.store.value.pendingTitle?.trim() || `钉钉 · ${message.senderNick ?? message.senderId}`;
+    const title = this.store.value.pendingTitle?.trim() || `钉钉 · ${sender.nick ?? sender.id}`;
     try {
       const started = await this.host.sessions.start({ prompt, directory, title });
       const binding: Binding = {
-        userId: message.senderId,
+        userId: sender.id,
         sessionId: started.sessionId,
         directory: started.directory ?? directory,
         title,
-        target: message.target,
+        target,
         boundAt: Date.now(),
       };
       await this.store.setBinding(binding);
@@ -381,10 +469,11 @@ export class Bridge {
       });
       await this.store.logActivity('state', `已新建会话 ${started.sessionId}`);
       this.onStateChange();
+      void this.syncSurface();
     } catch (error) {
       await this.store.logActivity('error', `新建会话失败：${errorText(error)}`);
       await this.reply(
-        message.target,
+        target,
         `没能新建会话：${errorText(error)}\n请确认面板里的项目目录还在。`,
       );
     }
@@ -630,212 +719,725 @@ export class Bridge {
 
   // ─── 钉钉里的命令 ───────────────────────────────────────────────────
 
-  private async handleCommand(message: InboundMessage, raw: string): Promise<boolean> {
-    const [head] = raw.trim().split(/\s+/, 1);
-    const name = (head ?? '').toLowerCase();
-    const argument = raw.trim().slice(head?.length ?? 0).trim();
-    const target = message.target;
+  // ─── 钉钉命令（语法对齐上游 help-catalog） ──────────────────────────
 
-    switch (name) {
-      case '/help':
-      case '/h':
-      case '/?': {
-        await this.reply(target, HELP_TEXT);
+  private async handleCommand(message: InboundMessage, raw: string): Promise<boolean> {
+    const target = message.target;
+    const sender = senderOf(message);
+    const command = parseSlashCommand(raw);
+
+    if (!command) {
+      const name = (raw.trim().split(/\s+/, 1)[0] ?? '').replace(/^\//, '');
+      const suggestion = suggestCommand(name);
+      if (suggestion) {
+        const entry = findHelpEntry(suggestion);
+        await this.reply(target, `未知命令 \`/${name}\`，你想用的可能是 \`/${suggestion}\`。\n用法：${entry?.usage ?? ''}`);
         return true;
       }
-      case '/status': {
-        await this.reply(target, await this.statusText());
-        return true;
-      }
-      case '/ping': {
-        await this.reply(target, '🏓 连接正常。');
-        return true;
-      }
-      case '/id': {
-        await this.reply(
-          target,
-          `你的 staffId：\`${message.senderId}\`\n会话：\`${this.store.binding?.sessionId ?? '（未绑定）'}\``,
-        );
-        return true;
-      }
-      case '/new': {
-        const previous = this.store.binding;
-        await this.closeCards('已切换到新会话，这张卡片结束了。');
-        await this.store.setBinding(null);
-        await this.store.setPendingTitle(argument || null);
-        this.pendings.length = 0;
-        this.onStateChange();
-        await this.reply(
-          target,
-          `${previous ? '已解除当前会话，' : ''}下一条消息会新建一个会话${argument ? `（标题：${argument}）` : ''}。`,
-        );
-        return true;
-      }
-      case '/sessions': {
-        const list = this.store.value.sessions;
-        if (list.length === 0) {
-          await this.reply(target, '还没有通过钉钉建过会话。');
+      return false;
+    }
+
+    try {
+      switch (command.kind) {
+        case 'help': {
+          if (!command.topic) {
+            await this.reply(target, formatHelp());
+            return true;
+          }
+          const entry = findHelpEntry(command.topic);
+          await this.reply(
+            target,
+            entry ? helpTopic(entry) : `没有 /${command.topic.replace(/^\//, '')} 这条命令。\n\n${formatHelp()}`,
+          );
           return true;
         }
-        const current = this.store.binding?.sessionId;
-        const lines = list.slice(0, 10).map((entry, index) => {
-          const mark = entry.sessionId === current ? ' ✅' : '';
-          const title = entry.title || entry.directory || entry.sessionId;
-          return `${index + 1}. ${title}${mark}\n   \`${entry.sessionId}\``;
-        });
-        await this.reply(target, ['最近由钉钉创建的会话：', '', ...lines, '', '/switch 序号 可切回去。'].join('\n'));
-        return true;
-      }
-      case '/switch':
-      case '/s': {
-        const list = this.store.value.sessions;
-        if (!argument) {
-          await this.reply(target, '用法：/switch 序号（用 /sessions 看列表）');
+
+        case 'status': {
+          await this.reply(target, await this.statusText(command.mode ?? 'full'));
           return true;
         }
-        const index = Number(argument);
-        const entry = Number.isInteger(index) && index >= 1 && index <= list.length
-          ? list[index - 1]
-          : list.find((item) => item.sessionId === argument);
-        if (!entry) {
-          await this.reply(target, `没有找到「${argument}」，用 /sessions 看看有哪些。`);
+
+        case 'stop': {
+          const binding = this.store.binding;
+          if (!binding) {
+            await this.reply(target, '当前没有绑定的会话。');
+            return true;
+          }
+          try {
+            const result = await this.host.sessions.stop(binding.sessionId);
+            // 被停下的回合不会再发 turn-finished，卡片要在这里收口。
+            this.bumpEpoch(binding.sessionId);
+            await this.closeCards('⏹ 这一轮被停止了。');
+            await this.reply(target, result.stopped ? '⏹ 已请求停止这一轮。' : '这一轮已经结束了。');
+          } catch (error) {
+            await this.reply(target, `停止失败：${errorText(error)}`);
+          }
           return true;
         }
-        await this.store.setBinding({
-          userId: message.senderId,
-          sessionId: entry.sessionId,
-          directory: entry.directory,
-          title: entry.title,
-          target,
-          boundAt: Date.now(),
-        });        await this.store.logActivity('state', `切换会话 ${entry.sessionId}`);
-        this.onStateChange();
-        await this.reply(target, `已切到「${entry.title || entry.sessionId}」。`);
-        return true;
-      }
-      case '/stop': {
-        const binding = this.store.binding;
-        if (!binding) {
-          await this.reply(target, '当前没有绑定的会话。');
+
+        case 'next': {
+          await this.flushRetryQueue(target);
           return true;
         }
-        try {
-          const result = await this.host.sessions.stop(binding.sessionId);
-          // 被停下的回合不会再发 turn-finished，卡片要在这里收口。
-          this.bumpEpoch(binding.sessionId);
-          await this.closeCards('⏹ 这一轮被停止了。');
-          await this.reply(target, result.stopped ? '⏹ 已请求停止这一轮。' : '这一轮已经结束了。');
-        } catch (error) {
-          await this.reply(target, `停止失败：${errorText(error)}`);
-        }
-        return true;
-      }
-      case '/unbind': {
-        await this.closeCards('已解除绑定，这张卡片结束了。');
-        await this.store.setBinding(null);
-        await this.store.setPendingTitle(null);
-        this.pendings.length = 0;
-        this.onStateChange();
-        await this.reply(target, '已解除绑定，下一条消息会开新会话。');
-        return true;
-      }
-      case '/dir': {
-        if (!argument) {
-          await this.reply(target, `默认项目目录：\`${this.store.settings.directory || '（未设置）'}\``);
+
+        case 'session': {
+          await this.sessionCommand(command, message);
           return true;
         }
-        await this.store.patchSettings({ directory: argument });
-        this.onStateChange();
-        await this.reply(target, `已把默认项目目录设为 \`${argument}\`，下一条新会话就用它。`);
-        return true;
-      }
-      case '/notify': {
-        const on = argument.toLowerCase();
-        if (on !== 'on' && on !== 'off') {
-          await this.reply(target, `其它会话的提醒现在是：${this.store.settings.notifyOtherSessions ? '开' : '关'}。用法 /notify on|off`);
+
+        case 'workspace': {
+          await this.workspaceCommand(command, message);
           return true;
         }
-        await this.store.patchSettings({ notifyOtherSessions: on === 'on' });
-        this.onStateChange();
-        await this.reply(target, `其它会话结束时推送到钉钉：${on === 'on' ? '已打开' : '已关闭'}。`);
-        return true;
-      }
-      case '/pending':
-      case '/rq': {
-        const pending = this.pendings[0];
-        if (!pending) {
-          await this.reply(target, '当前没有等待你回答的请求。');
+
+        case 'history': {
+          await this.historyCommand(command, message);
           return true;
         }
-        await this.reply(
-          target,
-          pending.kind === 'permission'
-            ? '还有一条授权请求在等你：回复 1 允许，2 拒绝。'
-            : '还有一个提问在等你：按提示回复内容即可。',
-        );
-        return true;
+
+        case 'at': {
+          await this.atCommand(command, message);
+          return true;
+        }
+
+        case 'merge': {
+          if (command.mode === 'on') {
+            await this.store.patchSettings({ merge: true });
+            await this.reply(target, `已开启打字合并：停顿 ${MERGE_WINDOW_MS / 1000} 秒后合成一条；末尾带 .. 继续追加，带 !! 立即提交。`);
+          } else if (command.mode === 'off') {
+            await this.store.patchSettings({ merge: false });
+            const pending = this.mergeParts.length;
+            await this.flushMerge(target, sender);
+            await this.reply(target, pending > 0 ? `已关闭打字合并，暂存的 ${pending} 段已发出。` : '已关闭打字合并。');
+          } else {
+            await this.reply(
+              target,
+              `打字合并：${this.store.settings.merge ? '开' : '关'}；窗口 ${MERGE_WINDOW_MS / 1000} 秒，上限 ${MERGE_MAX_PARTS} 段，当前暂存 ${this.mergeParts.length} 段。`,
+            );
+          }
+          return true;
+        }
+
+        case 'media': {
+          const settings = this.store.settings;
+          if (command.action === 'merge') {
+            await this.store.patchSettings({ mediaMerge: command.mode === 'on' });
+            if (command.mode === 'off') await this.flushHeldFiles(target, sender);
+            await this.reply(
+              target,
+              command.mode === 'on'
+                ? '已开启附件合并：不带文字的图片/文件会和下一条文字一起发。'
+                : '已关闭附件合并，暂存附件已单独发出。',
+            );
+          } else if (command.action === 'ref') {
+            await this.store.patchSettings({ mediaRef: command.style });
+            await this.reply(target, command.style === 'at' ? '附件在消息里写成 @路径。' : '附件在消息里写成「附件路径：…」。');
+          } else {
+            await this.reply(
+              target,
+              `附件合并：${settings.mediaMerge ? '开' : '关'}；写法：${settings.mediaRef === 'at' ? '@路径' : '附件路径'}；当前暂存 ${this.heldFiles.length} 个。`,
+            );
+          }
+          return true;
+        }
+
+        case 'notify': {
+          if (command.mode === 'tasks') {
+            await this.reply(target, 'OpenChamber 没有任务事件，`/notify tasks` 没有对应能力。');
+            return true;
+          }
+          if (command.mode === 'on' || command.mode === 'off') {
+            await this.store.patchSettings({ notifyOtherSessions: command.mode === 'on' });
+            this.onStateChange();
+            await this.reply(target, `其它会话结束推送到钉钉：${command.mode === 'on' ? '已打开' : '已关闭'}。`);
+            return true;
+          }
+          await this.reply(target, `其它会话提醒：${this.store.settings.notifyOtherSessions ? '开' : '关'}。用法 /notify on|off`);
+          return true;
+        }
+
+        case 'surface': {
+          if (command.mode === 'on' || command.mode === 'off') {
+            await this.store.patchSettings({ surface: command.mode === 'on' });
+            await this.syncSurface();
+            this.onStateChange();
+          }
+          await this.reply(
+            target,
+            `渠道提示词：${this.store.settings.surface ? '开' : '关'}。开启后会给 agent 一段“你在钉钉里对话”的说明。`,
+          );
+          return true;
+        }
+
+        case 'raw': {
+          if (command.mode === 'on') await this.store.patchSettings({ rawMode: true, rawOnce: false });
+          else if (command.mode === 'once') await this.store.patchSettings({ rawOnce: true });
+          else if (command.mode === 'off') await this.store.patchSettings({ rawMode: false, rawOnce: false });
+          const settings = this.store.settings;
+          const state = settings.rawMode ? '开' : settings.rawOnce ? '下一条' : '关';
+          await this.reply(
+            target,
+            command.mode === 'status' ? `透传：${state}。用法 /raw on|off|once|status` : `透传：${state}。`,
+          );
+          return true;
+        }
+
+        case 'card': {
+          await this.resolveCards(command.action, command.index, target);
+          return true;
+        }
+
+        case 'dropped': {
+          const reason = DROPPED_COMMANDS[command.command] ?? 'OpenChamber 没有对应能力。';
+          await this.reply(target, `\`${command.command.replace(/^session /, '/s ')}\` 在 OpenChamber 里没有对应能力：${reason}`);
+          return true;
+        }
+
+        default:
+          return false;
       }
-      default:
-        return false;
+    } catch (error) {
+      await this.reply(target, `命令执行失败：${errorText(error)}`);
+      return true;
     }
   }
 
-  private async statusText(): Promise<string> {
+  // ─── /session ───────────────────────────────────────────────────────
+
+  private async sessionCommand(
+    command: Extract<SlashCommand, { kind: 'session' }>,
+    message: InboundMessage,
+  ): Promise<void> {
+    const target = message.target;
+    const binding = this.store.binding;
+
+    if (command.action === 'status') {
+      const lines = ['🗂 **当前会话**', ''];
+      if (!binding) {
+        lines.push('未绑定：下一条消息会新建，或用 `/s list` 选一个。');
+      } else {
+        lines.push(
+          `标题：${binding.title || '未命名'}`,
+          `目录：\`${binding.directory || '未知'}\``,
+          `ID：\`${binding.sessionId}\``,
+        );
+        try {
+          const status = await this.host.sessions.status(binding.sessionId);
+          lines.push(`状态：${statusLabel(status.status)}`);
+        } catch {
+          lines.push('状态：会话已不可用，发一条消息会重建');
+        }
+      }
+      await this.reply(target, lines.join('\n'));
+      return;
+    }
+
+    if (command.action === 'new') {
+      const previous = this.store.binding;
+      await this.closeCards('已切换到新会话，这张卡片结束了。');
+      await this.store.setBinding(null);
+      await this.store.setPendingTitle(command.title ?? null);
+      this.pendings.length = 0;
+      this.onStateChange();
+      await this.reply(
+        target,
+        `${previous ? '已解除当前会话；' : ''}下一条消息会新建会话${command.title ? `（标题：${command.title}）` : ''}。`,
+      );
+      return;
+    }
+
+    const reader = await this.requireReader(target);
+    if (!reader) return;
+
+    if (command.action === 'list') {
+      const directory = command.scope === 'current'
+        ? (binding?.directory || this.store.settings.directory)
+        : undefined;
+      const sessions = await reader.listSessions(directory ? { directory } : {});
+      if (sessions.length === 0) {
+        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : '还没有任何会话。');
+        return;
+      }
+      const limit = command.limit === 'all' ? sessions.length : Math.min(command.limit, sessions.length);
+      const page = sessions.slice(0, limit);
+      this.lastSessionList = page.map((session) => session.id);
+      const lines = [
+        `🗂 **会话**（${command.scope === 'current' ? '当前目录，' : ''}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ''}）`,
+        '',
+      ];
+      page.forEach((session, index) => {
+        const mark = binding?.sessionId === session.id ? ' ✅' : '';
+        const where = session.directory ? ` · ${session.directory}` : '';
+        lines.push(`${index + 1}. ${session.title}${mark}`, `   \`${session.id}\`${where} · ${relativeTime(session.updatedAt)}`);
+      });
+      lines.push('', '切换：`/s switch 序号`；只看当前目录：`/s list current`');
+      await this.reply(target, lines.join('\n'));
+      return;
+    }
+
+    // switch
+    let sessionId = command.target;
+    if (/^\d+$/.test(command.target)) {
+      const index = Number(command.target);
+      let source = this.lastSessionList;
+      if (command.scope === 'current' || source.length === 0) {
+        const directory = binding?.directory || this.store.settings.directory;
+        const scoped = await reader.listSessions(directory && command.scope === 'current' ? { directory } : {});
+        source = scoped.map((session) => session.id);
+      }
+      sessionId = source[index - 1] ?? '';
+      if (!sessionId) {
+        await this.reply(target, `没有第 ${index} 个会话，先看 /s list。`);
+        return;
+      }
+    }
+
+    const all = await reader.listSessions();
+    const found = all.find((session) => session.id === sessionId || session.id.startsWith(sessionId));
+    if (!found) {
+      await this.reply(target, `没有找到会话「${command.target}」。`);
+      return;
+    }
+    await this.closeCards('已切换会话，这张卡片结束了。');
+    await this.store.setBinding({
+      userId: message.senderId,
+      sessionId: found.id,
+      directory: found.directory,
+      title: found.title,
+      target,
+      boundAt: Date.now(),
+    });
+    await this.store.rememberSession({
+      sessionId: found.id,
+      title: found.title,
+      directory: found.directory,
+      at: Date.now(),
+    });
+    await this.store.logActivity('state', `切换会话 ${found.id}`);
+    this.onStateChange();
+    await this.reply(target, `已切到「${found.title}」。`);
+  }
+
+  // ─── /workspace ─────────────────────────────────────────────────────
+
+  private async workspaceCommand(
+    command: Extract<SlashCommand, { kind: 'workspace' }>,
+    message: InboundMessage,
+  ): Promise<void> {
+    const target = message.target;
+    const settings = this.store.settings;
+
+    if (command.action === 'status') {
+      const binding = this.store.binding;
+      await this.reply(
+        target,
+        [
+          '📁 **工作区**',
+          '',
+          `默认目录：\`${settings.directory || '未设置'}\``,
+          `当前会话目录：\`${binding?.directory || '（无）'}\``,
+          '',
+          '切换：`/ws list` 看编号，再 `/ws switch 序号`。',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    if (command.action === 'list') {
+      const reader = await this.requireReader(target);
+      if (!reader) return;
+      const projects = await reader.listProjects();
+      if (projects.length === 0) {
+        await this.reply(target, '还没有任何项目。');
+        return;
+      }
+      const limit = command.limit === 'all' ? projects.length : Math.min(command.limit, projects.length);
+      const page = projects.slice(0, limit);
+      this.lastWorkspaceList = page.map((project) => project.worktree);
+      const lines = [
+        `📁 **工作区**（共 ${projects.length} 个${limit < projects.length ? `，显示 ${limit} 个` : ''}）`,
+        '',
+      ];
+      page.forEach((project, index) => {
+        const mark = settings.directory === project.worktree ? ' ✅' : '';
+        lines.push(`${index + 1}. \`${project.worktree}\`${mark}`);
+      });
+      lines.push('', '切换：`/ws switch 序号` 或 `/ws switch 路径`');
+      await this.reply(target, lines.join('\n'));
+      return;
+    }
+
+    let directory = '';
+    if (command.action === 'switch' && /^\d+$/.test(command.target)) {
+      const index = Number(command.target);
+      directory = this.lastWorkspaceList[index - 1] ?? '';
+      if (!directory) {
+        await this.reply(target, `没有第 ${index} 个项目，先看 /ws list。`);
+        return;
+      }
+    } else {
+      directory = command.action === 'switch' ? command.target : command.path;
+    }
+
+    if (!(await isDirectory(directory))) {
+      await this.reply(target, `这个目录不存在：\`${directory}\``);
+      return;
+    }
+
+    await this.closeCards('已切换工作区，这张卡片结束了。');
+    await this.store.patchSettings({ directory });
+    await this.store.setBinding(null);
+    await this.store.setPendingTitle(null);
+    this.pendings.length = 0;
+    this.onStateChange();
+    await this.reply(target, `已把默认目录设为 \`${directory}\`；下一条消息会在那里新建会话。`);
+  }
+
+  // ─── /history ───────────────────────────────────────────────────────
+
+  private async historyCommand(
+    command: Extract<SlashCommand, { kind: 'history' }>,
+    message: InboundMessage,
+  ): Promise<void> {
+    const target = message.target;
+    const binding = this.store.binding;
+    if (!binding) {
+      await this.reply(target, '还没有绑定会话：发一条消息，或 `/s list` 选一个。');
+      return;
+    }
+    const reader = await this.requireReader(target);
+    if (!reader) return;
+
+    const turns = await reader.listTurns(binding.sessionId);
+    if (turns.length === 0) {
+      await this.reply(target, '这个会话还没有历史。');
+      return;
+    }
+
+    if (command.action === 'show') {
+      const turn = turns[command.index - 1];
+      if (!turn) {
+        await this.reply(target, `没有第 ${command.index} 轮（共 ${turns.length} 轮）。`);
+        return;
+      }
+      await this.reply(
+        target,
+        [
+          `🧾 **第 ${command.index} 轮**`,
+          '',
+          `**你**：${clip(turn.user, 3_000) || '（无文字）'}`,
+          '',
+          `**agent**：${clip(turn.reply, 6_000) || '（无文字）'}`,
+        ].join('\n'),
+      );
+      return;
+    }
+
+    const limit = command.limit === 'all' ? turns.length : Math.min(command.limit, turns.length);
+    const page = turns.slice(-limit);
+    const offset = turns.length - page.length;
+    const lines = [`🧾 **最近 ${page.length} 轮**（共 ${turns.length} 轮）`, ''];
+    page.forEach((turn, index) => {
+      lines.push(
+        `${offset + index + 1}. 你：${clip(oneLine(turn.user), 60) || '（无文字）'}`,
+        `   ↳ ${clip(oneLine(turn.reply), 80) || '（无回复）'}`,
+      );
+    });
+    const last = turns[turns.length - 1];
+    if (last) {
+      lines.push(
+        '',
+        `**第 ${turns.length} 轮全文**`,
+        '',
+        `你：${clip(last.user, 1_500) || '（无文字）'}`,
+        '',
+        `agent：${clip(last.reply, 3_000) || '（无回复）'}`,
+      );
+    }
+    lines.push('', '看某一轮：`/history show 序号`');
+    await this.reply(target, lines.join('\n'));
+  }
+
+  // ─── /at ────────────────────────────────────────────────────────────
+
+  private async atCommand(
+    command: Extract<SlashCommand, { kind: 'at' }>,
+    message: InboundMessage,
+  ): Promise<void> {
+    const target = message.target;
+    switch (command.action) {
+      case 'status': {
+        if (this.refs.length === 0) {
+          await this.reply(target, '还没有引用。用法：`/at f <路径>`，下一条消息会带上路径。');
+          return;
+        }
+        await this.reply(
+          target,
+          ['📎 **已引用文件**', '', ...this.refs.map((file, index) => `${index + 1}. \`${file}\``), '', '清空：`/at clear`'].join('\n'),
+        );
+        return;
+      }
+      case 'file':
+        this.refs.push(command.path);
+        await this.reply(target, `已引用：\`${command.path}\`（下一条消息会带上）`);
+        return;
+      case 'remove': {
+        const removed = this.refs.splice(command.index - 1, 1);
+        await this.reply(target, removed.length > 0 ? `已移除：\`${removed[0]}\`` : `没有第 ${command.index} 个引用。`);
+        return;
+      }
+      case 'clear':
+        this.refs = [];
+        await this.reply(target, '已清空引用。');
+        return;
+      case 'session':
+        await this.reply(
+          target,
+          'OpenChamber 里的 agent 读不到别的会话，`/at s` 没有对应能力。要引用文件请用 `/at f <路径>`。',
+        );
+        return;
+    }
+  }
+
+  // ─── /rq、/rp ───────────────────────────────────────────────────────
+
+  private async resolveCards(
+    action: 'close-question' | 'reject-permission',
+    index: number | undefined,
+    target: ReplyTarget,
+  ): Promise<void> {
+    const scope = index ? this.pendings.slice(index - 1, index) : [...this.pendings];
+    const relevant = scope.filter((item) => (action === 'close-question' ? item.kind === 'form' : item.kind === 'permission'));
+    if (relevant.length === 0) {
+      await this.reply(
+        target,
+        index
+          ? `第 ${index} 张卡不是${action === 'close-question' ? '提问卡' : '权限卡'}。`
+          : action === 'close-question'
+            ? '没有待处理的提问卡；权限卡用 `/rp`。'
+            : '没有待处理的权限卡。',
+      );
+      return;
+    }
+
+    let done = 0;
+    for (const pending of relevant) {
+      try {
+        if (action === 'close-question' && pending.kind === 'form') {
+          await this.host.sessions.answerForm(pending.sessionId, pending.formId, null, '用户在钉钉里关闭了提问');
+        } else if (action === 'reject-permission' && pending.kind === 'permission') {
+          await this.host.sessions.answerPermission(pending.sessionId, pending.requestId, {
+            decision: 'deny',
+            message: '用户在钉钉里拒绝了',
+          });
+        }
+        done += 1;
+      } catch {
+        // 已经在别处回答过了。
+      }
+      const at = this.pendings.indexOf(pending);
+      if (at >= 0) this.pendings.splice(at, 1);
+    }
+    this.onStateChange();
+    await this.reply(target, `已${action === 'close-question' ? '关闭' : '拒绝'} ${done} 张卡。`);
+  }
+
+  // ─── 合并、暂存、重发 ───────────────────────────────────────────────
+
+  private scheduleMergeFlush(target: ReplyTarget, sender: { id: string; nick?: string }): void {
+    if (this.mergeTimer) clearTimeout(this.mergeTimer);
+    this.mergeTimer = setTimeout(() => {
+      this.mergeTimer = null;
+      this.enqueue(() => this.flushMerge(target, sender));
+    }, MERGE_WINDOW_MS);
+    this.mergeTimer.unref?.();
+  }
+
+  private async flushMerge(target: ReplyTarget, sender: { id: string; nick?: string }): Promise<void> {
+    if (this.mergeTimer) {
+      clearTimeout(this.mergeTimer);
+      this.mergeTimer = null;
+    }
+    if (this.mergeParts.length === 0) return;
+    const prompt = this.mergeParts.join('\n\n');
+    this.mergeParts = [];
+    await this.deliver(target, sender, prompt);
+  }
+
+  private async flushHeldFiles(target: ReplyTarget, sender: { id: string; nick?: string }): Promise<void> {
+    if (this.heldFiles.length === 0) return;
+    const files = this.heldFiles.splice(0);
+    await this.deliver(target, sender, this.fileLines(files));
+  }
+
+  private enqueueRetry(target: ReplyTarget | null, text: string): void {
+    if (!target) return;
+    this.retryQueue.push({ target, text, at: Date.now() });
+    while (this.retryQueue.length > RETRY_MAX) this.retryQueue.shift();
+  }
+
+  private async flushRetryQueue(target: ReplyTarget): Promise<void> {
+    if (this.retryQueue.length === 0) {
+      await this.reply(target, '没有暂存的消息。');
+      return;
+    }
+    const queue = this.retryQueue.splice(0);
+    let ok = 0;
+    let firstError = '';
+    for (const item of queue) {
+      try {
+        await this.sendChecked(item.target, item.text);
+        ok += 1;
+      } catch (error) {
+        firstError = firstError || errorText(error);
+        this.retryQueue.push(item);
+      }
+    }
+    await this.reply(
+      target,
+      firstError
+        ? `重发 ${ok} 条，仍有 ${this.retryQueue.length} 条失败：${firstError}`
+        : `已重发 ${ok} 条暂存消息。`,
+    );
+  }
+
+  // ─── 渠道提示词 ─────────────────────────────────────────────────────
+
+  private async syncSurface(): Promise<void> {
+    const settings = this.store.settings;
+    const directory = this.store.binding?.directory || settings.directory || null;
+    try {
+      await this.host.setInstructions(directory, settings.surface ? SURFACE_TEXT : '');
+    } catch (error) {
+      this.log(`设置渠道提示词失败：${errorText(error)}`);
+    }
+  }
+
+  // ─── 状态 ───────────────────────────────────────────────────────────
+
+  private async requireReader(target: ReplyTarget): Promise<OpenCodeReader | null> {
+    if (this.opencode) return this.opencode;
+    await this.reply(
+      target,
+      '这条命令需要读取会话与项目的权限：在 设置 → 扩展 → 钉钉桥接 里批准「读取 OpenCode 会话」，然后重启 OpenChamber。',
+    );
+    return null;
+  }
+
+  private async statusText(mode: 'brief' | 'full' = 'full'): Promise<string> {
     const settings = this.store.settings;
     const binding = this.store.binding;
     const lines = [
       '📋 **钉钉桥接状态**',
       '',
       `凭据：${this.configured ? '已配置' : '未配置'}`,
+      `当前会话：${binding ? binding.title || binding.sessionId : '未绑定'}`,
       `默认目录：\`${settings.directory || '未设置'}\``,
-      `其它会话提醒：${settings.notifyOtherSessions ? '开' : '关'}`,
+      `模式：raw ${settings.rawMode ? '开' : settings.rawOnce ? '下一条' : '关'} · merge ${settings.merge ? '开' : '关'} · media ${settings.mediaMerge ? '开' : '关'} · notify ${settings.notifyOtherSessions ? '开' : '关'} · surface ${settings.surface ? '开' : '关'}`,
     ];
-    if (binding) {
-      lines.push(`当前会话：${binding.title || binding.sessionId}`, `\`${binding.sessionId}\``);
-      try {
-        const status = await this.host.sessions.status(binding.sessionId);
-        lines.push(`运行状态：${status.status === 'busy' ? '正在处理' : status.status === 'waiting' ? '等待你回答' : '空闲'}`);
-      } catch {
-        lines.push('运行状态：会话已不可用，发一条消息会重建');
+
+    if (mode === 'full') {
+      if (binding) {
+        lines.push(`会话 ID：\`${binding.sessionId}\``, `会话目录：\`${binding.directory || '未知'}\``);
+        try {
+          const status = await this.host.sessions.status(binding.sessionId);
+          lines.push(`运行状态：${statusLabel(status.status)}`);
+        } catch {
+          lines.push('运行状态：会话已不可用，发一条消息会重建');
+        }
       }
-    } else {
-      lines.push('当前会话：未绑定（下一条消息会新建）');
-    }
-    if (this.pendings.length > 0) {
-      lines.push(`等你回答：${this.pendings.length} 个请求`);
+      if (this.pendings.length > 0) {
+        lines.push(`等你回答：${this.pendings.length} 个请求（1 允 / 2 拒，/rq 关闭提问，/rp 拒绝权限）`);
+      }
+      if (this.mergeParts.length > 0) lines.push(`暂存合并：${this.mergeParts.length} 段（/merge off 立即发送）`);
+      if (this.heldFiles.length > 0) lines.push(`暂存附件：${this.heldFiles.length} 个（/media off 立即发送）`);
+      if (this.refs.length > 0) lines.push(`已引用文件：${this.refs.length} 个（/at 查看）`);
+      if (this.retryQueue.length > 0) lines.push(`待重发：${this.retryQueue.length} 条（/next）`);
+      const activity = this.store.value.activity.slice(-3).reverse();
+      if (activity.length > 0) {
+        lines.push('', '最近动态：');
+        for (const entry of activity) lines.push(`- ${entry.text}`);
+      }
     }
     return lines.join('\n');
   }
 }
-
-export const HELP_TEXT = [
-  '🤖 **钉钉 ⇄ OpenChamber**',
-  '',
-  '直接发消息就是给 agent 的新指令；图片和文件会存到本机并把路径一起交给 agent。',
-  '',
-  '**会话**',
-  '`/new [标题]` 下一条消息开新会话',
-  '`/sessions` 最近由钉钉建过的会话',
-  '`/switch 序号` 切回旧会话',
-  '`/unbind` 解除绑定',
-  '`/stop` 中断当前这一轮',
-  '',
-  '**运行**',
-  '`/status` 绑定、目录、当前状态',
-  '`/notify on|off` 其它会话结束时也推到钉钉',
-  '`/dir [路径]` 查看或设置默认项目目录',
-  '`/pending` 查看等待回答的授权或提问',
-  '`/ping` 连通性检查',
-  '`/help` 这份说明',
-  '',
-  '授权请求回复 **1** 允许、**2** 拒绝；提问按提示回复序号或「字段=值」。',
-].join('\n');
 
 function cardTarget(target: ReplyTarget) {
   if (target.conversationType === 'group') {
     return { type: 'group' as const, openConversationId: target.openConversationId ?? target.conversationId };
   }
   return { type: 'user' as const, ...(target.userId ? { userId: target.userId } : {}) };
+}
+
+function senderOf(message: InboundMessage): { id: string; nick?: string } {
+  return { id: message.senderId, ...(message.senderNick ? { nick: message.senderNick } : {}) };
+}
+
+function refLines(files: string[]): string {
+  return ['引用文件（/at）：', ...files.map((file) => `- ${file}`), '需要时请直接读取这些文件。'].join('\n');
+}
+
+function statusLabel(status: 'idle' | 'busy' | 'waiting'): string {
+  return status === 'busy' ? '正在处理' : status === 'waiting' ? '等待你回答' : '空闲';
+}
+
+function clip(value: string, max: number): string {
+  const body = value.trim();
+  return body.length <= max ? body : `${body.slice(0, max - 1)}…`;
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function relativeTime(at: number): string {
+  if (!at) return '时间未知';
+  const delta = Date.now() - at;
+  if (delta < 60_000) return '刚刚';
+  if (delta < 3_600_000) return `${Math.round(delta / 60_000)} 分钟前`;
+  if (delta < 86_400_000) return `${Math.round(delta / 3_600_000)} 小时前`;
+  return `${Math.round(delta / 86_400_000)} 天前`;
+}
+
+async function isDirectory(target: string): Promise<boolean> {
+  try {
+    return (await stat(target)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** 打错的命令给个提示（上游的 mistyped-command 行为），别把它当成聊天转给 agent。 */
+function suggestCommand(name: string): string | null {
+  const needle = name.toLowerCase();
+  if (!needle) return null;
+  const candidates = ['help', 'status', 'stop', 'next', 'session', 'workspace', 'history', 'at', 'merge', 'media', 'notify', 'surface', 'raw', 'rq', 'rp'];
+  let best: { name: string; distance: number } | null = null;
+  for (const candidate of candidates) {
+    const distance = levenshtein(needle, candidate);
+    if (distance <= 2 && (!best || distance < best.distance)) best = { name: candidate, distance };
+  }
+  return best?.name ?? null;
+}
+
+function levenshtein(a: string, b: string): number {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const matrix: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
+  for (let row = 0; row < rows; row += 1) matrix[row]![0] = row;
+  for (let col = 0; col < cols; col += 1) matrix[0]![col] = col;
+  for (let row = 1; row < rows; row += 1) {
+    for (let col = 1; col < cols; col += 1) {
+      const cost = a[row - 1] === b[col - 1] ? 0 : 1;
+      matrix[row]![col] = Math.min(
+        (matrix[row - 1]![col] ?? 0) + 1,
+        (matrix[row]![col - 1] ?? 0) + 1,
+        (matrix[row - 1]![col - 1] ?? 0) + cost,
+      );
+    }
+  }
+  return matrix[rows - 1]![cols - 1] ?? 0;
 }
 
 function errorText(error: unknown): string {

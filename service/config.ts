@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import type { ReplyTarget } from './dingtalk/types.js';
 
-/** 面板里能改的字段。 */
+/** 面板里能改的字段 + 钉钉命令里的开关。 */
 export type BridgeSettings = {
   clientId: string;
   clientSecret: string;
@@ -26,6 +26,18 @@ export type BridgeSettings = {
   enabled: boolean;
   /** 别的会话结束一轮时也推到钉钉。 */
   notifyOtherSessions: boolean;
+  /** `/raw on`：斜杠命令与文本原样交给 agent。 */
+  rawMode: boolean;
+  /** `/raw once`：只透传下一条。 */
+  rawOnce: boolean;
+  /** `/merge on`：连续打字合并成一条消息。 */
+  merge: boolean;
+  /** `/media on`：不带文字的附件等下一条文字一起发。 */
+  mediaMerge: boolean;
+  /** `/media at|path`：附件在 prompt 里的写法。 */
+  mediaRef: 'at' | 'path';
+  /** `/surface on`：给 agent 注入“你在钉钉里对话”的渠道提示词。 */
+  surface: boolean;
 };
 
 /** 钉钉用户 ⇄ OpenChamber 会话。 */
@@ -71,6 +83,12 @@ export const DEFAULT_SETTINGS: BridgeSettings = {
   allowedUsers: [],
   enabled: true,
   notifyOtherSessions: false,
+  rawMode: false,
+  rawOnce: false,
+  merge: false,
+  mediaMerge: false,
+  mediaRef: 'path',
+  surface: false,
 };
 
 const ACTIVITY_MAX = 30;
@@ -112,6 +130,12 @@ export function normalizeStore(value: unknown): Store {
     allowedUsers: stringList(settingsRaw.allowedUsers),
     enabled: bool(settingsRaw.enabled, true),
     notifyOtherSessions: bool(settingsRaw.notifyOtherSessions, false),
+    rawMode: bool(settingsRaw.rawMode, false),
+    rawOnce: bool(settingsRaw.rawOnce, false),
+    merge: bool(settingsRaw.merge, false),
+    mediaMerge: bool(settingsRaw.mediaMerge, false),
+    mediaRef: settingsRaw.mediaRef === 'at' ? 'at' : 'path',
+    surface: bool(settingsRaw.surface, false),
   };
 
   const bindingRaw = raw.binding && typeof raw.binding === 'object' ? (raw.binding as Record<string, unknown>) : null;
@@ -226,6 +250,12 @@ export class ConfigStore {
       ...(patch.allowedUsers !== undefined ? { allowedUsers: stringList(patch.allowedUsers) } : {}),
       ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
       ...(patch.notifyOtherSessions !== undefined ? { notifyOtherSessions: patch.notifyOtherSessions } : {}),
+      ...(patch.rawMode !== undefined ? { rawMode: patch.rawMode } : {}),
+      ...(patch.rawOnce !== undefined ? { rawOnce: patch.rawOnce } : {}),
+      ...(patch.merge !== undefined ? { merge: patch.merge } : {}),
+      ...(patch.mediaMerge !== undefined ? { mediaMerge: patch.mediaMerge } : {}),
+      ...(patch.mediaRef !== undefined ? { mediaRef: patch.mediaRef === 'at' ? 'at' : 'path' } : {}),
+      ...(patch.surface !== undefined ? { surface: patch.surface } : {}),
     };
     this.state = { ...this.state, settings: next };
     await this.flush();

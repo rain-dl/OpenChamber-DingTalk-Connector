@@ -18,6 +18,7 @@ import { createServiceHost, readSessionEventRequest } from '@openchamber/sdk';
 import { Bridge } from './bridge.js';
 import { ConfigStore, resolveDataDir, type BridgeSettings } from './config.js';
 import { DingTalkStream, type StreamStatus } from './dingtalk/stream.js';
+import { createOpenCodeReader } from './opencode.js';
 import {
   drainOutbox,
   removeOutboxJob,
@@ -309,12 +310,14 @@ const server = http.createServer((request, response) => {
 
 async function main(): Promise<void> {
   store = await ConfigStore.open(DATA_DIR);
+  const opencode = createOpenCodeReader(process.env);
   bridge = new Bridge({
     store,
     host,
     dataDir: DATA_DIR,
     log,
     onStateChange: emitState,
+    ...(opencode ? { opencode } : {}),
   });
 
   server.listen(PORT, '127.0.0.1', () => {

@@ -3154,6 +3154,255 @@ var CONTROLLERS = new Set(SURFACE_CONTROLLERS);
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path2 from "node:path";
 
+// service/catalog.ts
+var GROUPS = [
+  { id: "basics", title: "常用", blurb: "查看帮助、查看状态、中断任务。" },
+  { id: "navigate", title: "会话与项目", blurb: "会话是一段独立的对话；项目是一个工作目录。" },
+  { id: "pacing", title: "输出节奏", blurb: "控制推送到钉钉的内容与时机。" },
+  { id: "reference", title: "引用与回看", blurb: "引用文件，或查看历史记录。" },
+  { id: "card", title: "待处理卡片", blurb: "关闭等待确认的权限卡与提问卡。" }
+];
+var HELP_INTRO = "以 / 开头的消息是指令。`/help <命令>` 看该命令的全部例子。";
+var HELP_FOOTER = [
+  "OpenChamber 没有对应能力的命令未提供：`/fork`、`/preset`、`/model`、`/reasoning`、`/perm`、`/enter`、`/steps`、`/skill`、`/flush`。",
+  "这些能力在 OpenChamber 应用里照常可用，只是钉钉侧没有对应命令。"
+].join(`
+`);
+var ENTRIES = [
+  {
+    command: "/help",
+    aliases: ["h", "?"],
+    summary: "查看指令清单与示例",
+    usage: "/help | /help <命令名或简写>（也可以 /h 或 /?）",
+    group: "basics",
+    examples: [
+      { line: "/help", note: "全部指令一览" },
+      { line: "/help s", note: "该命令的全部例子" },
+      { line: "/help merge", note: "写全名也一样" },
+      { line: "/h", note: "同 /help" },
+      { line: "/?", note: "同 /help" }
+    ]
+  },
+  {
+    command: "/status",
+    aliases: [],
+    summary: "查看当前状态，可切简洁或详细",
+    usage: "/status [brief|full]",
+    group: "basics",
+    examples: [
+      { line: "/status", note: "连接、绑定、目录与各开关" },
+      { line: "/status brief", note: "只显示模式与绑定摘要" },
+      { line: "/status full", note: "加上待处理请求与最近动态" }
+    ]
+  },
+  {
+    command: "/stop",
+    aliases: [],
+    summary: "中断当前任务",
+    usage: "/stop",
+    group: "basics",
+    examples: [{ line: "/stop", note: "已修改的文件不回滚" }]
+  },
+  {
+    command: "/next",
+    aliases: [],
+    summary: "继续发送暂存的消息",
+    usage: "/next",
+    group: "basics",
+    examples: [{ line: "/next", note: "重发钉钉限流或发送失败而暂存的消息" }]
+  },
+  {
+    command: "/session",
+    aliases: ["s"],
+    summary: "会话管理：列出、切换、新建",
+    usage: "/session list [current] [all|数量] | switch [current] <编号|会话 id> | new [标题] | status（裸 /s 看状态）",
+    group: "navigate",
+    examples: [
+      { line: "/s list", note: "最近 20 个会话（含应用里开的）" },
+      { line: "/s list current", note: "仅当前项目目录的会话" },
+      { line: "/s list all", note: "全部会话" },
+      { line: "/s switch 3", note: "切换到第 3 个（编号见 /s list）" },
+      { line: "/s switch current 2", note: "当前项目列表第 2 个" },
+      { line: "/s new", note: "下一条消息开新会话" },
+      { line: "/s status", note: "当前会话状态" }
+    ]
+  },
+  {
+    command: "/workspace",
+    aliases: ["ws"],
+    summary: "工作区管理：列出、切换",
+    usage: "/workspace list [all|数量] | status | switch <编号|路径> | add <路径>（裸 /ws 看状态）",
+    group: "navigate",
+    examples: [
+      { line: "/workspace list", note: "最近 20 个项目目录" },
+      { line: "/workspace list all", note: "全部项目目录" },
+      { line: "/workspace status", note: "当前默认目录" },
+      { line: "/workspace switch 2", note: "把第 2 个设为新会话目录" },
+      { line: "/workspace switch D:\\projects\\my-app", note: "按路径切换" },
+      { line: "/workspace add D:\\projects\\new-app", note: "添加并切换（只改钉钉会话的默认目录）" }
+    ]
+  },
+  {
+    command: "/merge",
+    aliases: ["mg"],
+    summary: "打字合并：多条消息合成一轮",
+    usage: "/merge on|off|status；正文末尾 `..` 继续追加、`!!` 立刻提交",
+    group: "pacing",
+    examples: [
+      { line: "/merge on", note: "开启：静默窗口后合并" },
+      { line: "/merge off", note: "关闭并发送暂存消息" },
+      { line: "/merge", note: "窗口、上限、暂存条数" },
+      { line: "/merge status", note: "同上" },
+      { line: "帮我改下登录页 ..", note: "追加：先不发送（需先 /merge on）", kind: "text" },
+      { line: "跑一下测试 !!", note: "立即提交（需先 /merge on）", kind: "text" }
+    ]
+  },
+  {
+    command: "/media",
+    aliases: ["md"],
+    summary: "图片/文件与文字合并发送",
+    usage: "/media on|off | at|path | status",
+    group: "pacing",
+    examples: [
+      { line: "/media on", note: "开启：附件与下一条文字合并" },
+      { line: "/media off", note: "关闭并发送暂存附件" },
+      { line: "/media at", note: "附件写成 @路径" },
+      { line: "/media path", note: "附件写成「附件路径：…」" },
+      { line: "/media", note: "两个开关的状态" },
+      { line: "/media status", note: "同上" }
+    ]
+  },
+  {
+    command: "/notify",
+    aliases: [],
+    summary: "跨会话提醒推送",
+    usage: "/notify on|off|status（也可以 /watch）",
+    group: "pacing",
+    examples: [
+      { line: "/notify on", note: "开启：其它会话结束也推钉钉" },
+      { line: "/notify off", note: "关闭" },
+      { line: "/notify", note: "当前状态" },
+      { line: "/notify status", note: "同上" }
+    ]
+  },
+  {
+    command: "/surface",
+    aliases: [],
+    summary: "钉钉渠道提示词开关",
+    usage: "/surface on|off|status（也可以 /wxprompt）",
+    group: "pacing",
+    examples: [
+      { line: "/surface on", note: "开启：给 agent 注入钉钉渠道提示词" },
+      { line: "/surface off", note: "关闭" },
+      { line: "/surface", note: "当前状态" }
+    ]
+  },
+  {
+    command: "/raw",
+    aliases: [],
+    summary: "强制透传：斜杠命令和文本原样交给 agent",
+    usage: "/raw on|off|once|status（透传期间只有 /raw 本身仍被拦截）",
+    group: "pacing",
+    examples: [
+      { line: "/raw on", note: "开启：之后每条消息都原样转发" },
+      { line: "/raw once", note: "只透传下一条，然后自动关闭" },
+      { line: "/raw off", note: "关闭（透传期间这条仍有效）" },
+      { line: "/raw", note: "查看当前是否在透传" }
+    ]
+  },
+  {
+    command: "/at",
+    aliases: [],
+    summary: "引用文件到下一条消息",
+    usage: "/at [f <路径> | rm <编号> | clear]；引用会话（s）在 OpenChamber 没有对应能力",
+    group: "reference",
+    examples: [
+      { line: "/at", note: "查看已引用（文件 N 个）" },
+      { line: "/at f D:\\logs\\build.log", note: "引用文件" },
+      { line: '/at f "D:\\my docs\\spec.md"', note: "含空格的路径加引号" },
+      { line: "/at rm 1", note: "移除第 1 个引用" },
+      { line: "/at clear", note: "清空全部引用" }
+    ]
+  },
+  {
+    command: "/history",
+    aliases: [],
+    summary: "回看历史轮次",
+    usage: "/history [list [all|数量] | show <编号>]（默认最近 5 轮）",
+    group: "reference",
+    examples: [
+      { line: "/history", note: "最近 5 轮，末轮全文" },
+      { line: "/history list 10", note: "最近 10 轮" },
+      { line: "/history list all", note: "全部轮次" },
+      { line: "/history show 3", note: "第 3 轮的完整问答" }
+    ]
+  },
+  {
+    command: "/rq",
+    aliases: [],
+    summary: "关闭待处理卡片",
+    usage: "/rq；其它卡片用 P1=/rq 这种写法点名",
+    group: "card",
+    examples: [
+      { line: "/rq", note: "关闭当前会话全部提问卡" },
+      { line: "P1=/rq", note: "仅关闭第 1 张卡" },
+      { line: "/rp", note: "只拒绝权限卡" }
+    ]
+  },
+  {
+    command: "/rp",
+    aliases: [],
+    summary: "拒绝待处理的权限卡",
+    usage: "/rp；其它卡片用 P1=/rp 这种写法点名",
+    group: "card",
+    examples: [
+      { line: "/rp", note: "拒绝当前会话全部权限请求" },
+      { line: "P2=/rp", note: "仅拒绝第 2 张卡" }
+    ]
+  }
+];
+function shortestSpelling(entry) {
+  const names = [entry.command.replace(/^\//, ""), ...entry.aliases];
+  const shortest = names.reduce((best, name) => name.length < best.length ? name : best);
+  return `/${shortest}`;
+}
+function findHelpEntry(topic) {
+  const needle = topic.trim().replace(/^\//, "").toLowerCase();
+  if (!needle)
+    return;
+  return ENTRIES.find((entry) => entry.command.replace(/^\//, "").toLowerCase() === needle || entry.aliases.some((alias) => alias.toLowerCase() === needle));
+}
+function formatHelp() {
+  const lines = ["\uD83E\uDD16 **钉钉 ⇄ OpenChamber**", HELP_INTRO, ""];
+  for (const group of GROUPS) {
+    const entries = ENTRIES.filter((entry) => entry.group === group.id);
+    if (entries.length === 0)
+      continue;
+    lines.push(`**${group.title}**`);
+    for (const entry of entries) {
+      lines.push(`\`${shortestSpelling(entry)}\` · ${entry.summary}`);
+    }
+    lines.push("");
+  }
+  lines.push(HELP_FOOTER);
+  return lines.join(`
+`);
+}
+function helpTopic(entry) {
+  const lines = [
+    `**${shortestSpelling(entry)}**（\`${entry.command}\`） · ${entry.summary}`,
+    "",
+    `用法：${entry.usage}`,
+    "",
+    "例子："
+  ];
+  for (const example of entry.examples) {
+    lines.push(`- \`${example.line}\` — ${example.note}`);
+  }
+  return lines.join(`
+`);
+}
+
 // service/dingtalk/api.ts
 import { randomUUID } from "node:crypto";
 
@@ -4531,12 +4780,235 @@ function parseFormAnswer(fields, text) {
   return { ok: true, values };
 }
 
+// service/slash.ts
+var DROPPED_COMMANDS = {
+  fork: "按轮次分叉需要 DSH 的会话树，OpenChamber 没有这个接口。",
+  preset: "OpenChamber 没有 agent 预设。",
+  model: "服务不能在会话中途换模型，请在 OpenChamber 里改。",
+  reasoning: "推理等级请在 OpenChamber 里设置。",
+  perm: "权限档请在 OpenChamber 里设置；授权请求会在钉钉里问你。",
+  enter: "繁忙时排队还是插话由 OpenChamber 自己决定。",
+  steps: "桥接只推送最终回复，没有执行步骤流。",
+  skill: "会话技能不在扩展可读的范围内。",
+  flush: "没有极简模式的暂存结论。",
+  "session pin": "会话置顶是应用里的能力，扩展不能改。",
+  "session unpin": "会话置顶是应用里的能力，扩展不能改。"
+};
+var DEFAULT_LIST = 20;
+var DEFAULT_HISTORY = 5;
+function splitArgs(text) {
+  const args = [];
+  let current = "";
+  let quoted = false;
+  for (const char of text.trim()) {
+    if (char === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (!quoted && /\s/.test(char)) {
+      if (current)
+        args.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current)
+    args.push(current);
+  return args;
+}
+function parseCount(value, fallback) {
+  if (!value)
+    return fallback;
+  if (value.toLowerCase() === "all")
+    return "all";
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : fallback;
+}
+function parseOnOff(value) {
+  const body = (value ?? "").toLowerCase();
+  if (body === "on" || body === "开")
+    return "on";
+  if (body === "off" || body === "关")
+    return "off";
+  return "status";
+}
+function splitCardPrefix(text) {
+  const match = /^p(\d+)\s*=\s*(\/.*)$/i.exec(text.trim());
+  if (!match)
+    return { body: text.trim() };
+  return { body: match[2] ?? "", index: Number(match[1]) };
+}
+function parseSlashCommand(raw) {
+  const { body, index: cardIndex } = splitCardPrefix(raw);
+  if (!body.startsWith("/"))
+    return null;
+  const [head] = body.split(/\s+/, 1);
+  const name = (head ?? "").toLowerCase().replace(/^\//, "");
+  const rest = body.trim().slice(head?.length ?? 0).trim();
+  const args = splitArgs(rest);
+  switch (name) {
+    case "help":
+    case "h":
+    case "?": {
+      const topic = rest.trim();
+      return topic ? { kind: "help", topic } : { kind: "help" };
+    }
+    case "status": {
+      const mode = (args[0] ?? "").toLowerCase();
+      if (mode === "brief" || mode === "full")
+        return { kind: "status", mode };
+      return { kind: "status" };
+    }
+    case "stop":
+      return { kind: "stop" };
+    case "next":
+      return { kind: "next" };
+    case "session":
+    case "s": {
+      const action = (args[0] ?? "").toLowerCase();
+      if (action === "list") {
+        const scope = (args[1] ?? "").toLowerCase();
+        if (scope === "current") {
+          return { kind: "session", action: "list", scope: "current", limit: parseCount(args[2], DEFAULT_LIST) };
+        }
+        if (scope === "all")
+          return { kind: "session", action: "list", scope: "all", limit: "all" };
+        if (!scope)
+          return { kind: "session", action: "list", scope: "all", limit: DEFAULT_LIST };
+        return { kind: "session", action: "list", scope: "all", limit: parseCount(scope, DEFAULT_LIST) };
+      }
+      if (action === "switch") {
+        const scope = (args[1] ?? "").toLowerCase() === "current" ? "current" : "all";
+        const target = scope === "current" ? args[2] : args[1];
+        if (!target)
+          return null;
+        return { kind: "session", action: "switch", scope, target };
+      }
+      if (action === "new") {
+        const title = args.slice(1).join(" ").trim();
+        return { kind: "session", action: "new", ...title ? { title } : {} };
+      }
+      if (action === "status" || !action)
+        return { kind: "session", action: "status" };
+      if (action === "pin" || action === "unpin")
+        return { kind: "dropped", command: `session ${action}` };
+      return null;
+    }
+    case "workspace":
+    case "ws": {
+      const action = (args[0] ?? "").toLowerCase();
+      if (action === "list")
+        return { kind: "workspace", action: "list", limit: parseCount(args[1], DEFAULT_LIST) };
+      if (action === "status" || !action)
+        return { kind: "workspace", action: "status" };
+      if (action === "switch") {
+        const target = args.slice(1).join(" ").trim();
+        return target ? { kind: "workspace", action: "switch", target } : null;
+      }
+      if (action === "add") {
+        const path = args.slice(1).join(" ").trim();
+        return path ? { kind: "workspace", action: "add", path } : null;
+      }
+      return null;
+    }
+    case "history": {
+      const action = (args[0] ?? "").toLowerCase();
+      if (!action)
+        return { kind: "history", action: "list", limit: DEFAULT_HISTORY };
+      if (action === "list")
+        return { kind: "history", action: "list", limit: parseCount(args[1], DEFAULT_HISTORY) };
+      if (action === "show") {
+        const numeric = Number(args[1]);
+        return Number.isInteger(numeric) && numeric > 0 ? { kind: "history", action: "show", index: numeric } : null;
+      }
+      return null;
+    }
+    case "at": {
+      const action = (args[0] ?? "").toLowerCase();
+      if (!action)
+        return { kind: "at", action: "status" };
+      if (action === "s")
+        return { kind: "at", action: "session" };
+      if (action === "f") {
+        const path = args.slice(1).join(" ").trim();
+        return path ? { kind: "at", action: "file", path } : null;
+      }
+      if (action === "rm" || action === "remove") {
+        const numeric = Number(args[1]);
+        return Number.isInteger(numeric) && numeric > 0 ? { kind: "at", action: "remove", index: numeric } : null;
+      }
+      if (action === "clear")
+        return { kind: "at", action: "clear" };
+      return null;
+    }
+    case "merge":
+    case "mg":
+      return { kind: "merge", mode: parseOnOff(args[0]) };
+    case "media":
+    case "md": {
+      const action = (args[0] ?? "").toLowerCase();
+      if (action === "on" || action === "off")
+        return { kind: "media", action: "merge", mode: action };
+      if (action === "at" || action === "path")
+        return { kind: "media", action: "ref", style: action };
+      return { kind: "media", action: "status" };
+    }
+    case "notify":
+    case "watch":
+    case "notice": {
+      const action = (args[0] ?? "").toLowerCase();
+      if (action === "tasks")
+        return { kind: "notify", mode: "tasks" };
+      return { kind: "notify", mode: parseOnOff(args[0]) };
+    }
+    case "surface":
+    case "wxprompt":
+      return { kind: "surface", mode: parseOnOff(args[0]) };
+    case "raw": {
+      const mode = (args[0] ?? "").toLowerCase();
+      if (mode === "on" || mode === "off" || mode === "once")
+        return { kind: "raw", mode };
+      return { kind: "raw", mode: "status" };
+    }
+    case "rq":
+      return { kind: "card", action: "close-question", ...cardIndex ? { index: cardIndex } : {} };
+    case "rp":
+      return { kind: "card", action: "reject-permission", ...cardIndex ? { index: cardIndex } : {} };
+    default:
+      if (DROPPED_COMMANDS[name])
+        return { kind: "dropped", command: name };
+      if (name === "p")
+        return { kind: "dropped", command: "preset" };
+      if (name === "f")
+        return { kind: "dropped", command: "flush" };
+      return null;
+  }
+}
+function splitMergeSuffix(text) {
+  const trimmed = text.trimEnd();
+  if (trimmed.endsWith("!!"))
+    return { text: trimmed.slice(0, -2).trimEnd(), mode: "submit" };
+  if (trimmed.endsWith(".."))
+    return { text: trimmed.slice(0, -2).trimEnd(), mode: "append" };
+  return { text: trimmed, mode: "auto" };
+}
+
 // service/bridge.ts
 var ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
 var REFUSAL_COOLDOWN_MS = 5 * 60000;
 var CARD_PLACEHOLDER = "⏳ 正在处理…";
 var TEXT_CHUNK_CHARS = 3500;
 var CARD_MAX_CHARS = 6000;
+var MERGE_WINDOW_MS = 1500;
+var MERGE_MAX_PARTS = 10;
+var RETRY_MAX = 5;
+var SURFACE_TEXT = [
+  "用户是通过钉钉和你对话的，回复会原样显示在钉钉聊天里。",
+  "请用简短的 Markdown：少用表格，不要依赖按钮、图片预览或需要鼠标的操作。",
+  "需要用户决定时直接问，他会在钉钉里回复，结果会转达给你。"
+].join(`
+`);
 
 class Bridge {
   store;
@@ -4545,12 +5017,20 @@ class Bridge {
   log;
   onStateChange;
   api;
+  opencode;
   pendings = [];
   cards = new Map;
   refusals = new Map;
   lastInbound = null;
   tail = Promise.resolve();
   epochs = new Map;
+  lastSessionList = [];
+  lastWorkspaceList = [];
+  refs = [];
+  mergeParts = [];
+  mergeTimer = null;
+  heldFiles = [];
+  retryQueue = [];
   constructor(deps) {
     this.store = deps.store;
     this.host = deps.host;
@@ -4558,6 +5038,7 @@ class Bridge {
     this.log = deps.log;
     this.onStateChange = deps.onStateChange;
     this.api = deps.api ?? createDingTalkApi({ logger: console });
+    this.opencode = deps.opencode ?? null;
   }
   whenIdle() {
     return this.tail;
@@ -4622,6 +5103,7 @@ class Bridge {
     } catch (error) {
       await this.store.logActivity("error", `回复失败：${errorText(error)}`);
       this.log(`回复钉钉失败：${errorText(error)}`);
+      this.enqueueRetry(target, text);
     }
   }
   async sendChecked(target, text) {
@@ -4703,9 +5185,25 @@ class Bridge {
       await this.store.refreshTarget(message.target);
       this.onStateChange();
     }
-    const text = message.text?.trim() ?? "";
+    let text = message.text?.trim() ?? "";
     await this.store.logActivity("in", text ? `${message.senderNick ?? message.senderId}: ${text}` : `${message.senderNick ?? message.senderId} 发来附件`);
     this.react(REACTION_THINKING_NAME, message.target.messageId);
+    if (settings.rawMode || settings.rawOnce) {
+      if (!/^\/raw(?:\s|$)/i.test(text)) {
+        if (settings.rawOnce && !settings.rawMode)
+          await this.store.patchSettings({ rawOnce: false });
+        const rawPrompt = await this.buildPrompt(message, text);
+        if (rawPrompt)
+          await this.deliver(message.target, senderOf(message), rawPrompt);
+        return;
+      }
+    }
+    let mergeMode = "auto";
+    if (settings.merge && text && !text.startsWith("/")) {
+      const split = splitMergeSuffix(text);
+      text = split.text;
+      mergeMode = split.mode;
+    }
     if (text.startsWith("/")) {
       const handled = await this.handleCommand(message, text);
       if (handled)
@@ -4716,12 +5214,25 @@ class Bridge {
       if (answered)
         return;
     }
-    const prompt = await this.buildPrompt(message);
+    const prompt = await this.buildPrompt(message, text);
     if (!prompt) {
+      if (this.heldFiles.length > 0)
+        return;
       await this.reply(message.target, "这条消息里没有可以转给 agent 的内容。");
       return;
     }
-    await this.deliver(message, prompt);
+    if (this.store.settings.merge) {
+      this.mergeParts.push(prompt);
+      if (mergeMode === "submit" || this.mergeParts.length >= MERGE_MAX_PARTS) {
+        await this.flushMerge(message.target, senderOf(message));
+        return;
+      }
+      if (mergeMode === "append")
+        return;
+      this.scheduleMergeFlush(message.target, senderOf(message));
+      return;
+    }
+    await this.deliver(message.target, senderOf(message), prompt);
   }
   allowed(senderId) {
     const settings = this.store.settings;
@@ -4739,32 +5250,52 @@ class Bridge {
     this.refusals.set(message.senderId, Date.now() + REFUSAL_COOLDOWN_MS);
     await this.reply(message.target, "这个机器人已经绑定了另一位用户，暂时不能响应你。需要换人请先在 OpenChamber 的「钉钉桥接」面板里解除绑定。");
   }
-  async buildPrompt(message) {
-    const lines = [];
-    const text = message.text?.trim() ?? "";
+  async buildPrompt(message, text) {
+    const parts = [];
     if (text)
-      lines.push(text);
+      parts.push(text);
+    const files = [];
     if (message.attachment) {
       try {
-        const downloaded = await downloadAttachment(this.api, { ...this.credentials, robotCode: this.robotCode, cardTemplateId: "" }, message.attachment, {
-          robotCode: this.robotCode,
-          maxBytes: ATTACHMENT_MAX_BYTES
-        });
-        const dir = path2.join(this.dataDir, "uploads");
-        await mkdir(dir, { recursive: true });
-        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const target = path2.join(dir, `${stamp}-${downloaded.fileName}`);
-        await writeFile(target, downloaded.bytes, { mode: 384 });
-        lines.push(lines.length > 0 ? "" : "钉钉发来一个附件，已保存到本机：", `附件路径：${target}`, "需要时请直接读取这个文件。");
-        await this.store.logActivity("state", `附件已保存：${downloaded.fileName}`);
+        const saved = await this.downloadToData(message.attachment);
+        if (!text && this.store.settings.mediaMerge) {
+          this.heldFiles.push(saved);
+          await this.store.logActivity("state", `附件暂存，等下一条文字：${path2.basename(saved)}`);
+          return "";
+        }
+        files.push(saved);
       } catch (error) {
-        lines.push(`（有一个钉钉附件没能下载：${errorText(error)}）`);
+        parts.push(`（有一个钉钉附件没能下载：${errorText(error)}）`);
       }
     }
-    return lines.join(`
+    const outgoing = [...this.heldFiles.splice(0), ...files];
+    if (outgoing.length > 0)
+      parts.push(this.fileLines(outgoing));
+    if (this.refs.length > 0) {
+      parts.push(refLines(this.refs));
+      this.refs = [];
+    }
+    return parts.join(`
 `).trim();
   }
-  async deliver(message, prompt) {
+  async downloadToData(attachment) {
+    const downloaded = await downloadAttachment(this.api, { ...this.credentials, robotCode: this.robotCode, cardTemplateId: "" }, attachment, { robotCode: this.robotCode, maxBytes: ATTACHMENT_MAX_BYTES });
+    const dir = path2.join(this.dataDir, "uploads");
+    await mkdir(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const target = path2.join(dir, `${stamp}-${downloaded.fileName}`);
+    await writeFile(target, downloaded.bytes, { mode: 384 });
+    await this.store.logActivity("state", `附件已保存：${downloaded.fileName}`);
+    return target;
+  }
+  fileLines(files) {
+    const style = this.store.settings.mediaRef;
+    const header = files.length > 1 ? "钉钉附件已保存到本机：" : "钉钉发来一个附件，已保存到本机：";
+    const lines = files.map((file) => style === "at" ? `@${file}` : `附件路径：${file}`);
+    return [header, ...lines, "需要时请直接读取这个文件。"].join(`
+`);
+  }
+  async deliver(target, sender, prompt) {
     const binding = this.store.binding;
     if (binding && binding.sessionId) {
       try {
@@ -4775,30 +5306,30 @@ class Bridge {
         await this.store.logActivity("error", `发送到会话失败：${errorText(error)}`);
         if (!gone) {
           await this.reply(binding.target, `没能把消息送到 OpenChamber：${errorText(error)}
-回复 /new 可以开一个新会话。`);
+回复 /s new 可以开一个新会话。`);
           return;
         }
         await this.store.setBinding(null);
         this.onStateChange();
       }
     }
-    await this.startSession(message, prompt);
+    await this.startSession(target, sender, prompt);
   }
-  async startSession(message, prompt) {
+  async startSession(target, sender, prompt) {
     const directory = this.store.settings.directory;
     if (!directory) {
-      await this.reply(message.target, "还差一步：在 OpenChamber 的「钉钉桥接」面板里选择默认项目目录，下一条消息就会开一个新会话。");
+      await this.reply(target, "还差一步：在 OpenChamber 的「钉钉桥接」面板里选择默认项目目录，下一条消息就会开一个新会话。");
       return;
     }
-    const title = this.store.value.pendingTitle?.trim() || `钉钉 · ${message.senderNick ?? message.senderId}`;
+    const title = this.store.value.pendingTitle?.trim() || `钉钉 · ${sender.nick ?? sender.id}`;
     try {
       const started = await this.host.sessions.start({ prompt, directory, title });
       const binding = {
-        userId: message.senderId,
+        userId: sender.id,
         sessionId: started.sessionId,
         directory: started.directory ?? directory,
         title,
-        target: message.target,
+        target,
         boundAt: Date.now()
       };
       await this.store.setBinding(binding);
@@ -4812,9 +5343,10 @@ class Bridge {
       });
       await this.store.logActivity("state", `已新建会话 ${started.sessionId}`);
       this.onStateChange();
+      this.syncSurface();
     } catch (error) {
       await this.store.logActivity("error", `新建会话失败：${errorText(error)}`);
-      await this.reply(message.target, `没能新建会话：${errorText(error)}
+      await this.reply(target, `没能新建会话：${errorText(error)}
 请确认面板里的项目目录还在。`);
     }
   }
@@ -5055,199 +5587,600 @@ ${body}`);
     return true;
   }
   async handleCommand(message, raw) {
-    const [head] = raw.trim().split(/\s+/, 1);
-    const name = (head ?? "").toLowerCase();
-    const argument = raw.trim().slice(head?.length ?? 0).trim();
     const target = message.target;
-    switch (name) {
-      case "/help":
-      case "/h":
-      case "/?": {
-        await this.reply(target, HELP_TEXT);
+    const sender = senderOf(message);
+    const command = parseSlashCommand(raw);
+    if (!command) {
+      const name = (raw.trim().split(/\s+/, 1)[0] ?? "").replace(/^\//, "");
+      const suggestion = suggestCommand(name);
+      if (suggestion) {
+        const entry = findHelpEntry(suggestion);
+        await this.reply(target, `未知命令 \`/${name}\`，你想用的可能是 \`/${suggestion}\`。
+用法：${entry?.usage ?? ""}`);
         return true;
       }
-      case "/status": {
-        await this.reply(target, await this.statusText());
-        return true;
-      }
-      case "/ping": {
-        await this.reply(target, "\uD83C\uDFD3 连接正常。");
-        return true;
-      }
-      case "/id": {
-        await this.reply(target, `你的 staffId：\`${message.senderId}\`
-会话：\`${this.store.binding?.sessionId ?? "（未绑定）"}\``);
-        return true;
-      }
-      case "/new": {
-        const previous = this.store.binding;
-        await this.closeCards("已切换到新会话，这张卡片结束了。");
-        await this.store.setBinding(null);
-        await this.store.setPendingTitle(argument || null);
-        this.pendings.length = 0;
-        this.onStateChange();
-        await this.reply(target, `${previous ? "已解除当前会话，" : ""}下一条消息会新建一个会话${argument ? `（标题：${argument}）` : ""}。`);
-        return true;
-      }
-      case "/sessions": {
-        const list = this.store.value.sessions;
-        if (list.length === 0) {
-          await this.reply(target, "还没有通过钉钉建过会话。");
+      return false;
+    }
+    try {
+      switch (command.kind) {
+        case "help": {
+          if (!command.topic) {
+            await this.reply(target, formatHelp());
+            return true;
+          }
+          const entry = findHelpEntry(command.topic);
+          await this.reply(target, entry ? helpTopic(entry) : `没有 /${command.topic.replace(/^\//, "")} 这条命令。
+
+${formatHelp()}`);
           return true;
         }
-        const current = this.store.binding?.sessionId;
-        const lines = list.slice(0, 10).map((entry, index) => {
-          const mark = entry.sessionId === current ? " ✅" : "";
-          const title = entry.title || entry.directory || entry.sessionId;
-          return `${index + 1}. ${title}${mark}
-   \`${entry.sessionId}\``;
-        });
-        await this.reply(target, ["最近由钉钉创建的会话：", "", ...lines, "", "/switch 序号 可切回去。"].join(`
-`));
-        return true;
-      }
-      case "/switch":
-      case "/s": {
-        const list = this.store.value.sessions;
-        if (!argument) {
-          await this.reply(target, "用法：/switch 序号（用 /sessions 看列表）");
+        case "status": {
+          await this.reply(target, await this.statusText(command.mode ?? "full"));
           return true;
         }
-        const index = Number(argument);
-        const entry = Number.isInteger(index) && index >= 1 && index <= list.length ? list[index - 1] : list.find((item) => item.sessionId === argument);
-        if (!entry) {
-          await this.reply(target, `没有找到「${argument}」，用 /sessions 看看有哪些。`);
+        case "stop": {
+          const binding = this.store.binding;
+          if (!binding) {
+            await this.reply(target, "当前没有绑定的会话。");
+            return true;
+          }
+          try {
+            const result = await this.host.sessions.stop(binding.sessionId);
+            this.bumpEpoch(binding.sessionId);
+            await this.closeCards("⏹ 这一轮被停止了。");
+            await this.reply(target, result.stopped ? "⏹ 已请求停止这一轮。" : "这一轮已经结束了。");
+          } catch (error) {
+            await this.reply(target, `停止失败：${errorText(error)}`);
+          }
           return true;
         }
-        await this.store.setBinding({
-          userId: message.senderId,
-          sessionId: entry.sessionId,
-          directory: entry.directory,
-          title: entry.title,
-          target,
-          boundAt: Date.now()
-        });
-        await this.store.logActivity("state", `切换会话 ${entry.sessionId}`);
-        this.onStateChange();
-        await this.reply(target, `已切到「${entry.title || entry.sessionId}」。`);
-        return true;
-      }
-      case "/stop": {
-        const binding = this.store.binding;
-        if (!binding) {
-          await this.reply(target, "当前没有绑定的会话。");
+        case "next": {
+          await this.flushRetryQueue(target);
           return true;
         }
-        try {
-          const result = await this.host.sessions.stop(binding.sessionId);
-          this.bumpEpoch(binding.sessionId);
-          await this.closeCards("⏹ 这一轮被停止了。");
-          await this.reply(target, result.stopped ? "⏹ 已请求停止这一轮。" : "这一轮已经结束了。");
-        } catch (error) {
-          await this.reply(target, `停止失败：${errorText(error)}`);
-        }
-        return true;
-      }
-      case "/unbind": {
-        await this.closeCards("已解除绑定，这张卡片结束了。");
-        await this.store.setBinding(null);
-        await this.store.setPendingTitle(null);
-        this.pendings.length = 0;
-        this.onStateChange();
-        await this.reply(target, "已解除绑定，下一条消息会开新会话。");
-        return true;
-      }
-      case "/dir": {
-        if (!argument) {
-          await this.reply(target, `默认项目目录：\`${this.store.settings.directory || "（未设置）"}\``);
+        case "session": {
+          await this.sessionCommand(command, message);
           return true;
         }
-        await this.store.patchSettings({ directory: argument });
-        this.onStateChange();
-        await this.reply(target, `已把默认项目目录设为 \`${argument}\`，下一条新会话就用它。`);
-        return true;
-      }
-      case "/notify": {
-        const on = argument.toLowerCase();
-        if (on !== "on" && on !== "off") {
-          await this.reply(target, `其它会话的提醒现在是：${this.store.settings.notifyOtherSessions ? "开" : "关"}。用法 /notify on|off`);
+        case "workspace": {
+          await this.workspaceCommand(command, message);
           return true;
         }
-        await this.store.patchSettings({ notifyOtherSessions: on === "on" });
-        this.onStateChange();
-        await this.reply(target, `其它会话结束时推送到钉钉：${on === "on" ? "已打开" : "已关闭"}。`);
-        return true;
-      }
-      case "/pending":
-      case "/rq": {
-        const pending = this.pendings[0];
-        if (!pending) {
-          await this.reply(target, "当前没有等待你回答的请求。");
+        case "history": {
+          await this.historyCommand(command, message);
           return true;
         }
-        await this.reply(target, pending.kind === "permission" ? "还有一条授权请求在等你：回复 1 允许，2 拒绝。" : "还有一个提问在等你：按提示回复内容即可。");
-        return true;
+        case "at": {
+          await this.atCommand(command, message);
+          return true;
+        }
+        case "merge": {
+          if (command.mode === "on") {
+            await this.store.patchSettings({ merge: true });
+            await this.reply(target, `已开启打字合并：停顿 ${MERGE_WINDOW_MS / 1000} 秒后合成一条；末尾带 .. 继续追加，带 !! 立即提交。`);
+          } else if (command.mode === "off") {
+            await this.store.patchSettings({ merge: false });
+            const pending = this.mergeParts.length;
+            await this.flushMerge(target, sender);
+            await this.reply(target, pending > 0 ? `已关闭打字合并，暂存的 ${pending} 段已发出。` : "已关闭打字合并。");
+          } else {
+            await this.reply(target, `打字合并：${this.store.settings.merge ? "开" : "关"}；窗口 ${MERGE_WINDOW_MS / 1000} 秒，上限 ${MERGE_MAX_PARTS} 段，当前暂存 ${this.mergeParts.length} 段。`);
+          }
+          return true;
+        }
+        case "media": {
+          const settings = this.store.settings;
+          if (command.action === "merge") {
+            await this.store.patchSettings({ mediaMerge: command.mode === "on" });
+            if (command.mode === "off")
+              await this.flushHeldFiles(target, sender);
+            await this.reply(target, command.mode === "on" ? "已开启附件合并：不带文字的图片/文件会和下一条文字一起发。" : "已关闭附件合并，暂存附件已单独发出。");
+          } else if (command.action === "ref") {
+            await this.store.patchSettings({ mediaRef: command.style });
+            await this.reply(target, command.style === "at" ? "附件在消息里写成 @路径。" : "附件在消息里写成「附件路径：…」。");
+          } else {
+            await this.reply(target, `附件合并：${settings.mediaMerge ? "开" : "关"}；写法：${settings.mediaRef === "at" ? "@路径" : "附件路径"}；当前暂存 ${this.heldFiles.length} 个。`);
+          }
+          return true;
+        }
+        case "notify": {
+          if (command.mode === "tasks") {
+            await this.reply(target, "OpenChamber 没有任务事件，`/notify tasks` 没有对应能力。");
+            return true;
+          }
+          if (command.mode === "on" || command.mode === "off") {
+            await this.store.patchSettings({ notifyOtherSessions: command.mode === "on" });
+            this.onStateChange();
+            await this.reply(target, `其它会话结束推送到钉钉：${command.mode === "on" ? "已打开" : "已关闭"}。`);
+            return true;
+          }
+          await this.reply(target, `其它会话提醒：${this.store.settings.notifyOtherSessions ? "开" : "关"}。用法 /notify on|off`);
+          return true;
+        }
+        case "surface": {
+          if (command.mode === "on" || command.mode === "off") {
+            await this.store.patchSettings({ surface: command.mode === "on" });
+            await this.syncSurface();
+            this.onStateChange();
+          }
+          await this.reply(target, `渠道提示词：${this.store.settings.surface ? "开" : "关"}。开启后会给 agent 一段“你在钉钉里对话”的说明。`);
+          return true;
+        }
+        case "raw": {
+          if (command.mode === "on")
+            await this.store.patchSettings({ rawMode: true, rawOnce: false });
+          else if (command.mode === "once")
+            await this.store.patchSettings({ rawOnce: true });
+          else if (command.mode === "off")
+            await this.store.patchSettings({ rawMode: false, rawOnce: false });
+          const settings = this.store.settings;
+          const state = settings.rawMode ? "开" : settings.rawOnce ? "下一条" : "关";
+          await this.reply(target, command.mode === "status" ? `透传：${state}。用法 /raw on|off|once|status` : `透传：${state}。`);
+          return true;
+        }
+        case "card": {
+          await this.resolveCards(command.action, command.index, target);
+          return true;
+        }
+        case "dropped": {
+          const reason = DROPPED_COMMANDS[command.command] ?? "OpenChamber 没有对应能力。";
+          await this.reply(target, `\`${command.command.replace(/^session /, "/s ")}\` 在 OpenChamber 里没有对应能力：${reason}`);
+          return true;
+        }
+        default:
+          return false;
       }
-      default:
-        return false;
+    } catch (error) {
+      await this.reply(target, `命令执行失败：${errorText(error)}`);
+      return true;
     }
   }
-  async statusText() {
+  async sessionCommand(command, message) {
+    const target = message.target;
+    const binding = this.store.binding;
+    if (command.action === "status") {
+      const lines = ["\uD83D\uDDC2 **当前会话**", ""];
+      if (!binding) {
+        lines.push("未绑定：下一条消息会新建，或用 `/s list` 选一个。");
+      } else {
+        lines.push(`标题：${binding.title || "未命名"}`, `目录：\`${binding.directory || "未知"}\``, `ID：\`${binding.sessionId}\``);
+        try {
+          const status = await this.host.sessions.status(binding.sessionId);
+          lines.push(`状态：${statusLabel(status.status)}`);
+        } catch {
+          lines.push("状态：会话已不可用，发一条消息会重建");
+        }
+      }
+      await this.reply(target, lines.join(`
+`));
+      return;
+    }
+    if (command.action === "new") {
+      const previous = this.store.binding;
+      await this.closeCards("已切换到新会话，这张卡片结束了。");
+      await this.store.setBinding(null);
+      await this.store.setPendingTitle(command.title ?? null);
+      this.pendings.length = 0;
+      this.onStateChange();
+      await this.reply(target, `${previous ? "已解除当前会话；" : ""}下一条消息会新建会话${command.title ? `（标题：${command.title}）` : ""}。`);
+      return;
+    }
+    const reader = await this.requireReader(target);
+    if (!reader)
+      return;
+    if (command.action === "list") {
+      const directory = command.scope === "current" ? binding?.directory || this.store.settings.directory : undefined;
+      const sessions = await reader.listSessions(directory ? { directory } : {});
+      if (sessions.length === 0) {
+        await this.reply(target, directory ? `\`${directory}\` 下还没有会话。` : "还没有任何会话。");
+        return;
+      }
+      const limit = command.limit === "all" ? sessions.length : Math.min(command.limit, sessions.length);
+      const page = sessions.slice(0, limit);
+      this.lastSessionList = page.map((session) => session.id);
+      const lines = [
+        `\uD83D\uDDC2 **会话**（${command.scope === "current" ? "当前目录，" : ""}共 ${sessions.length} 个${limit < sessions.length ? `，显示最近 ${limit} 个` : ""}）`,
+        ""
+      ];
+      page.forEach((session, index) => {
+        const mark = binding?.sessionId === session.id ? " ✅" : "";
+        const where = session.directory ? ` · ${session.directory}` : "";
+        lines.push(`${index + 1}. ${session.title}${mark}`, `   \`${session.id}\`${where} · ${relativeTime(session.updatedAt)}`);
+      });
+      lines.push("", "切换：`/s switch 序号`；只看当前目录：`/s list current`");
+      await this.reply(target, lines.join(`
+`));
+      return;
+    }
+    let sessionId = command.target;
+    if (/^\d+$/.test(command.target)) {
+      const index = Number(command.target);
+      let source = this.lastSessionList;
+      if (command.scope === "current" || source.length === 0) {
+        const directory = binding?.directory || this.store.settings.directory;
+        const scoped = await reader.listSessions(directory && command.scope === "current" ? { directory } : {});
+        source = scoped.map((session) => session.id);
+      }
+      sessionId = source[index - 1] ?? "";
+      if (!sessionId) {
+        await this.reply(target, `没有第 ${index} 个会话，先看 /s list。`);
+        return;
+      }
+    }
+    const all = await reader.listSessions();
+    const found = all.find((session) => session.id === sessionId || session.id.startsWith(sessionId));
+    if (!found) {
+      await this.reply(target, `没有找到会话「${command.target}」。`);
+      return;
+    }
+    await this.closeCards("已切换会话，这张卡片结束了。");
+    await this.store.setBinding({
+      userId: message.senderId,
+      sessionId: found.id,
+      directory: found.directory,
+      title: found.title,
+      target,
+      boundAt: Date.now()
+    });
+    await this.store.rememberSession({
+      sessionId: found.id,
+      title: found.title,
+      directory: found.directory,
+      at: Date.now()
+    });
+    await this.store.logActivity("state", `切换会话 ${found.id}`);
+    this.onStateChange();
+    await this.reply(target, `已切到「${found.title}」。`);
+  }
+  async workspaceCommand(command, message) {
+    const target = message.target;
+    const settings = this.store.settings;
+    if (command.action === "status") {
+      const binding = this.store.binding;
+      await this.reply(target, [
+        "\uD83D\uDCC1 **工作区**",
+        "",
+        `默认目录：\`${settings.directory || "未设置"}\``,
+        `当前会话目录：\`${binding?.directory || "（无）"}\``,
+        "",
+        "切换：`/ws list` 看编号，再 `/ws switch 序号`。"
+      ].join(`
+`));
+      return;
+    }
+    if (command.action === "list") {
+      const reader = await this.requireReader(target);
+      if (!reader)
+        return;
+      const projects = await reader.listProjects();
+      if (projects.length === 0) {
+        await this.reply(target, "还没有任何项目。");
+        return;
+      }
+      const limit = command.limit === "all" ? projects.length : Math.min(command.limit, projects.length);
+      const page = projects.slice(0, limit);
+      this.lastWorkspaceList = page.map((project) => project.worktree);
+      const lines = [
+        `\uD83D\uDCC1 **工作区**（共 ${projects.length} 个${limit < projects.length ? `，显示 ${limit} 个` : ""}）`,
+        ""
+      ];
+      page.forEach((project, index) => {
+        const mark = settings.directory === project.worktree ? " ✅" : "";
+        lines.push(`${index + 1}. \`${project.worktree}\`${mark}`);
+      });
+      lines.push("", "切换：`/ws switch 序号` 或 `/ws switch 路径`");
+      await this.reply(target, lines.join(`
+`));
+      return;
+    }
+    let directory = "";
+    if (command.action === "switch" && /^\d+$/.test(command.target)) {
+      const index = Number(command.target);
+      directory = this.lastWorkspaceList[index - 1] ?? "";
+      if (!directory) {
+        await this.reply(target, `没有第 ${index} 个项目，先看 /ws list。`);
+        return;
+      }
+    } else {
+      directory = command.action === "switch" ? command.target : command.path;
+    }
+    if (!await isDirectory(directory)) {
+      await this.reply(target, `这个目录不存在：\`${directory}\``);
+      return;
+    }
+    await this.closeCards("已切换工作区，这张卡片结束了。");
+    await this.store.patchSettings({ directory });
+    await this.store.setBinding(null);
+    await this.store.setPendingTitle(null);
+    this.pendings.length = 0;
+    this.onStateChange();
+    await this.reply(target, `已把默认目录设为 \`${directory}\`；下一条消息会在那里新建会话。`);
+  }
+  async historyCommand(command, message) {
+    const target = message.target;
+    const binding = this.store.binding;
+    if (!binding) {
+      await this.reply(target, "还没有绑定会话：发一条消息，或 `/s list` 选一个。");
+      return;
+    }
+    const reader = await this.requireReader(target);
+    if (!reader)
+      return;
+    const turns = await reader.listTurns(binding.sessionId);
+    if (turns.length === 0) {
+      await this.reply(target, "这个会话还没有历史。");
+      return;
+    }
+    if (command.action === "show") {
+      const turn = turns[command.index - 1];
+      if (!turn) {
+        await this.reply(target, `没有第 ${command.index} 轮（共 ${turns.length} 轮）。`);
+        return;
+      }
+      await this.reply(target, [
+        `\uD83E\uDDFE **第 ${command.index} 轮**`,
+        "",
+        `**你**：${clip(turn.user, 3000) || "（无文字）"}`,
+        "",
+        `**agent**：${clip(turn.reply, 6000) || "（无文字）"}`
+      ].join(`
+`));
+      return;
+    }
+    const limit = command.limit === "all" ? turns.length : Math.min(command.limit, turns.length);
+    const page = turns.slice(-limit);
+    const offset = turns.length - page.length;
+    const lines = [`\uD83E\uDDFE **最近 ${page.length} 轮**（共 ${turns.length} 轮）`, ""];
+    page.forEach((turn, index) => {
+      lines.push(`${offset + index + 1}. 你：${clip(oneLine(turn.user), 60) || "（无文字）"}`, `   ↳ ${clip(oneLine(turn.reply), 80) || "（无回复）"}`);
+    });
+    const last = turns[turns.length - 1];
+    if (last) {
+      lines.push("", `**第 ${turns.length} 轮全文**`, "", `你：${clip(last.user, 1500) || "（无文字）"}`, "", `agent：${clip(last.reply, 3000) || "（无回复）"}`);
+    }
+    lines.push("", "看某一轮：`/history show 序号`");
+    await this.reply(target, lines.join(`
+`));
+  }
+  async atCommand(command, message) {
+    const target = message.target;
+    switch (command.action) {
+      case "status": {
+        if (this.refs.length === 0) {
+          await this.reply(target, "还没有引用。用法：`/at f <路径>`，下一条消息会带上路径。");
+          return;
+        }
+        await this.reply(target, ["\uD83D\uDCCE **已引用文件**", "", ...this.refs.map((file, index) => `${index + 1}. \`${file}\``), "", "清空：`/at clear`"].join(`
+`));
+        return;
+      }
+      case "file":
+        this.refs.push(command.path);
+        await this.reply(target, `已引用：\`${command.path}\`（下一条消息会带上）`);
+        return;
+      case "remove": {
+        const removed = this.refs.splice(command.index - 1, 1);
+        await this.reply(target, removed.length > 0 ? `已移除：\`${removed[0]}\`` : `没有第 ${command.index} 个引用。`);
+        return;
+      }
+      case "clear":
+        this.refs = [];
+        await this.reply(target, "已清空引用。");
+        return;
+      case "session":
+        await this.reply(target, "OpenChamber 里的 agent 读不到别的会话，`/at s` 没有对应能力。要引用文件请用 `/at f <路径>`。");
+        return;
+    }
+  }
+  async resolveCards(action, index, target) {
+    const scope = index ? this.pendings.slice(index - 1, index) : [...this.pendings];
+    const relevant = scope.filter((item) => action === "close-question" ? item.kind === "form" : item.kind === "permission");
+    if (relevant.length === 0) {
+      await this.reply(target, index ? `第 ${index} 张卡不是${action === "close-question" ? "提问卡" : "权限卡"}。` : action === "close-question" ? "没有待处理的提问卡；权限卡用 `/rp`。" : "没有待处理的权限卡。");
+      return;
+    }
+    let done = 0;
+    for (const pending of relevant) {
+      try {
+        if (action === "close-question" && pending.kind === "form") {
+          await this.host.sessions.answerForm(pending.sessionId, pending.formId, null, "用户在钉钉里关闭了提问");
+        } else if (action === "reject-permission" && pending.kind === "permission") {
+          await this.host.sessions.answerPermission(pending.sessionId, pending.requestId, {
+            decision: "deny",
+            message: "用户在钉钉里拒绝了"
+          });
+        }
+        done += 1;
+      } catch {}
+      const at = this.pendings.indexOf(pending);
+      if (at >= 0)
+        this.pendings.splice(at, 1);
+    }
+    this.onStateChange();
+    await this.reply(target, `已${action === "close-question" ? "关闭" : "拒绝"} ${done} 张卡。`);
+  }
+  scheduleMergeFlush(target, sender) {
+    if (this.mergeTimer)
+      clearTimeout(this.mergeTimer);
+    this.mergeTimer = setTimeout(() => {
+      this.mergeTimer = null;
+      this.enqueue(() => this.flushMerge(target, sender));
+    }, MERGE_WINDOW_MS);
+    this.mergeTimer.unref?.();
+  }
+  async flushMerge(target, sender) {
+    if (this.mergeTimer) {
+      clearTimeout(this.mergeTimer);
+      this.mergeTimer = null;
+    }
+    if (this.mergeParts.length === 0)
+      return;
+    const prompt = this.mergeParts.join(`
+
+`);
+    this.mergeParts = [];
+    await this.deliver(target, sender, prompt);
+  }
+  async flushHeldFiles(target, sender) {
+    if (this.heldFiles.length === 0)
+      return;
+    const files = this.heldFiles.splice(0);
+    await this.deliver(target, sender, this.fileLines(files));
+  }
+  enqueueRetry(target, text) {
+    if (!target)
+      return;
+    this.retryQueue.push({ target, text, at: Date.now() });
+    while (this.retryQueue.length > RETRY_MAX)
+      this.retryQueue.shift();
+  }
+  async flushRetryQueue(target) {
+    if (this.retryQueue.length === 0) {
+      await this.reply(target, "没有暂存的消息。");
+      return;
+    }
+    const queue = this.retryQueue.splice(0);
+    let ok = 0;
+    let firstError = "";
+    for (const item of queue) {
+      try {
+        await this.sendChecked(item.target, item.text);
+        ok += 1;
+      } catch (error) {
+        firstError = firstError || errorText(error);
+        this.retryQueue.push(item);
+      }
+    }
+    await this.reply(target, firstError ? `重发 ${ok} 条，仍有 ${this.retryQueue.length} 条失败：${firstError}` : `已重发 ${ok} 条暂存消息。`);
+  }
+  async syncSurface() {
+    const settings = this.store.settings;
+    const directory = this.store.binding?.directory || settings.directory || null;
+    try {
+      await this.host.setInstructions(directory, settings.surface ? SURFACE_TEXT : "");
+    } catch (error) {
+      this.log(`设置渠道提示词失败：${errorText(error)}`);
+    }
+  }
+  async requireReader(target) {
+    if (this.opencode)
+      return this.opencode;
+    await this.reply(target, "这条命令需要读取会话与项目的权限：在 设置 → 扩展 → 钉钉桥接 里批准「读取 OpenCode 会话」，然后重启 OpenChamber。");
+    return null;
+  }
+  async statusText(mode = "full") {
     const settings = this.store.settings;
     const binding = this.store.binding;
     const lines = [
       "\uD83D\uDCCB **钉钉桥接状态**",
       "",
       `凭据：${this.configured ? "已配置" : "未配置"}`,
+      `当前会话：${binding ? binding.title || binding.sessionId : "未绑定"}`,
       `默认目录：\`${settings.directory || "未设置"}\``,
-      `其它会话提醒：${settings.notifyOtherSessions ? "开" : "关"}`
+      `模式：raw ${settings.rawMode ? "开" : settings.rawOnce ? "下一条" : "关"} · merge ${settings.merge ? "开" : "关"} · media ${settings.mediaMerge ? "开" : "关"} · notify ${settings.notifyOtherSessions ? "开" : "关"} · surface ${settings.surface ? "开" : "关"}`
     ];
-    if (binding) {
-      lines.push(`当前会话：${binding.title || binding.sessionId}`, `\`${binding.sessionId}\``);
-      try {
-        const status = await this.host.sessions.status(binding.sessionId);
-        lines.push(`运行状态：${status.status === "busy" ? "正在处理" : status.status === "waiting" ? "等待你回答" : "空闲"}`);
-      } catch {
-        lines.push("运行状态：会话已不可用，发一条消息会重建");
+    if (mode === "full") {
+      if (binding) {
+        lines.push(`会话 ID：\`${binding.sessionId}\``, `会话目录：\`${binding.directory || "未知"}\``);
+        try {
+          const status = await this.host.sessions.status(binding.sessionId);
+          lines.push(`运行状态：${statusLabel(status.status)}`);
+        } catch {
+          lines.push("运行状态：会话已不可用，发一条消息会重建");
+        }
       }
-    } else {
-      lines.push("当前会话：未绑定（下一条消息会新建）");
-    }
-    if (this.pendings.length > 0) {
-      lines.push(`等你回答：${this.pendings.length} 个请求`);
+      if (this.pendings.length > 0) {
+        lines.push(`等你回答：${this.pendings.length} 个请求（1 允 / 2 拒，/rq 关闭提问，/rp 拒绝权限）`);
+      }
+      if (this.mergeParts.length > 0)
+        lines.push(`暂存合并：${this.mergeParts.length} 段（/merge off 立即发送）`);
+      if (this.heldFiles.length > 0)
+        lines.push(`暂存附件：${this.heldFiles.length} 个（/media off 立即发送）`);
+      if (this.refs.length > 0)
+        lines.push(`已引用文件：${this.refs.length} 个（/at 查看）`);
+      if (this.retryQueue.length > 0)
+        lines.push(`待重发：${this.retryQueue.length} 条（/next）`);
+      const activity = this.store.value.activity.slice(-3).reverse();
+      if (activity.length > 0) {
+        lines.push("", "最近动态：");
+        for (const entry of activity)
+          lines.push(`- ${entry.text}`);
+      }
     }
     return lines.join(`
 `);
   }
 }
-var HELP_TEXT = [
-  "\uD83E\uDD16 **钉钉 ⇄ OpenChamber**",
-  "",
-  "直接发消息就是给 agent 的新指令；图片和文件会存到本机并把路径一起交给 agent。",
-  "",
-  "**会话**",
-  "`/new [标题]` 下一条消息开新会话",
-  "`/sessions` 最近由钉钉建过的会话",
-  "`/switch 序号` 切回旧会话",
-  "`/unbind` 解除绑定",
-  "`/stop` 中断当前这一轮",
-  "",
-  "**运行**",
-  "`/status` 绑定、目录、当前状态",
-  "`/notify on|off` 其它会话结束时也推到钉钉",
-  "`/dir [路径]` 查看或设置默认项目目录",
-  "`/pending` 查看等待回答的授权或提问",
-  "`/ping` 连通性检查",
-  "`/help` 这份说明",
-  "",
-  "授权请求回复 **1** 允许、**2** 拒绝；提问按提示回复序号或「字段=值」。"
-].join(`
-`);
 function cardTarget(target) {
   if (target.conversationType === "group") {
     return { type: "group", openConversationId: target.openConversationId ?? target.conversationId };
   }
   return { type: "user", ...target.userId ? { userId: target.userId } : {} };
+}
+function senderOf(message) {
+  return { id: message.senderId, ...message.senderNick ? { nick: message.senderNick } : {} };
+}
+function refLines(files) {
+  return ["引用文件（/at）：", ...files.map((file) => `- ${file}`), "需要时请直接读取这些文件。"].join(`
+`);
+}
+function statusLabel(status) {
+  return status === "busy" ? "正在处理" : status === "waiting" ? "等待你回答" : "空闲";
+}
+function clip(value, max) {
+  const body = value.trim();
+  return body.length <= max ? body : `${body.slice(0, max - 1)}…`;
+}
+function oneLine(value) {
+  return value.replace(/\s+/g, " ").trim();
+}
+function relativeTime(at) {
+  if (!at)
+    return "时间未知";
+  const delta = Date.now() - at;
+  if (delta < 60000)
+    return "刚刚";
+  if (delta < 3600000)
+    return `${Math.round(delta / 60000)} 分钟前`;
+  if (delta < 86400000)
+    return `${Math.round(delta / 3600000)} 小时前`;
+  return `${Math.round(delta / 86400000)} 天前`;
+}
+async function isDirectory(target) {
+  try {
+    return (await stat(target)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function suggestCommand(name) {
+  const needle = name.toLowerCase();
+  if (!needle)
+    return null;
+  const candidates = ["help", "status", "stop", "next", "session", "workspace", "history", "at", "merge", "media", "notify", "surface", "raw", "rq", "rp"];
+  let best = null;
+  for (const candidate of candidates) {
+    const distance = levenshtein(needle, candidate);
+    if (distance <= 2 && (!best || distance < best.distance))
+      best = { name: candidate, distance };
+  }
+  return best?.name ?? null;
+}
+function levenshtein(a, b) {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const matrix = Array.from({ length: rows }, () => new Array(cols).fill(0));
+  for (let row = 0;row < rows; row += 1)
+    matrix[row][0] = row;
+  for (let col = 0;col < cols; col += 1)
+    matrix[0][col] = col;
+  for (let row = 1;row < rows; row += 1) {
+    for (let col = 1;col < cols; col += 1) {
+      const cost = a[row - 1] === b[col - 1] ? 0 : 1;
+      matrix[row][col] = Math.min((matrix[row - 1][col] ?? 0) + 1, (matrix[row][col - 1] ?? 0) + 1, (matrix[row - 1][col - 1] ?? 0) + cost);
+    }
+  }
+  return matrix[rows - 1][cols - 1] ?? 0;
 }
 function errorText(error) {
   if (error instanceof Error)
@@ -5290,7 +6223,13 @@ function normalizeStore(value) {
     directory: text(settingsRaw.directory),
     allowedUsers: stringList(settingsRaw.allowedUsers),
     enabled: bool(settingsRaw.enabled, true),
-    notifyOtherSessions: bool(settingsRaw.notifyOtherSessions, false)
+    notifyOtherSessions: bool(settingsRaw.notifyOtherSessions, false),
+    rawMode: bool(settingsRaw.rawMode, false),
+    rawOnce: bool(settingsRaw.rawOnce, false),
+    merge: bool(settingsRaw.merge, false),
+    mediaMerge: bool(settingsRaw.mediaMerge, false),
+    mediaRef: settingsRaw.mediaRef === "at" ? "at" : "path",
+    surface: bool(settingsRaw.surface, false)
   };
   const bindingRaw = raw.binding && typeof raw.binding === "object" ? raw.binding : null;
   const bindingTarget = bindingRaw?.target && typeof bindingRaw.target === "object" ? bindingRaw.target : null;
@@ -5376,7 +6315,13 @@ class ConfigStore {
       ...patch.directory !== undefined ? { directory: text(patch.directory) } : {},
       ...patch.allowedUsers !== undefined ? { allowedUsers: stringList(patch.allowedUsers) } : {},
       ...patch.enabled !== undefined ? { enabled: patch.enabled } : {},
-      ...patch.notifyOtherSessions !== undefined ? { notifyOtherSessions: patch.notifyOtherSessions } : {}
+      ...patch.notifyOtherSessions !== undefined ? { notifyOtherSessions: patch.notifyOtherSessions } : {},
+      ...patch.rawMode !== undefined ? { rawMode: patch.rawMode } : {},
+      ...patch.rawOnce !== undefined ? { rawOnce: patch.rawOnce } : {},
+      ...patch.merge !== undefined ? { merge: patch.merge } : {},
+      ...patch.mediaMerge !== undefined ? { mediaMerge: patch.mediaMerge } : {},
+      ...patch.mediaRef !== undefined ? { mediaRef: patch.mediaRef === "at" ? "at" : "path" } : {},
+      ...patch.surface !== undefined ? { surface: patch.surface } : {}
     };
     this.state = { ...this.state, settings: next };
     await this.flush();
@@ -5848,6 +6793,135 @@ class DingTalkStream {
   }
 }
 
+// service/opencode.ts
+var REQUEST_TIMEOUT_MS = 1e4;
+function text2(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+function asArray(value) {
+  if (Array.isArray(value))
+    return value;
+  if (value && typeof value === "object") {
+    const record = value;
+    for (const key of ["data", "items", "sessions", "projects", "messages"]) {
+      if (Array.isArray(record[key]))
+        return record[key];
+    }
+  }
+  return [];
+}
+function partText(parts) {
+  if (!Array.isArray(parts))
+    return "";
+  const chunks = [];
+  for (const part of parts) {
+    if (!part || typeof part !== "object")
+      continue;
+    const record = part;
+    if (record.type === "text" && typeof record.text === "string" && record.text.trim()) {
+      chunks.push(record.text.trim());
+    }
+  }
+  return chunks.join(`
+
+`).trim();
+}
+function createOpenCodeReader(env = process.env) {
+  const baseUrl = text2(env.OPENCHAMBER_OPENCODE_URL);
+  const token = text2(env.OPENCHAMBER_SERVICE_TOKEN);
+  if (!baseUrl || !token)
+    return null;
+  const get = async (path) => {
+    const controller = new AbortController;
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, "")}${path}`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new Error(`OpenCode 返回 ${response.status}${body ? `：${body.slice(0, 120)}` : ""}`);
+      }
+      return await response.json();
+    } catch (error) {
+      if (controller.signal.aborted)
+        throw new Error("读取 OpenCode 超时");
+      throw error instanceof Error ? error : new Error(String(error));
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const listProjects = async () => {
+    const raw = asArray(await get("/api/project"));
+    const projects = [];
+    for (const item of raw) {
+      if (!item || typeof item !== "object")
+        continue;
+      const record = item;
+      const worktree = text2(record.worktree) || text2(record.directory) || text2(record.path);
+      if (!worktree)
+        continue;
+      projects.push({ id: text2(record.id) || worktree, worktree });
+    }
+    return projects.sort((a, b) => a.worktree.localeCompare(b.worktree));
+  };
+  const listSessions = async (options = {}) => {
+    const raw = asArray(await get("/api/session"));
+    const sessions = [];
+    for (const item of raw) {
+      if (!item || typeof item !== "object")
+        continue;
+      const record = item;
+      const id = text2(record.id);
+      if (!id)
+        continue;
+      if (text2(record.parentID) || text2(record.parentId))
+        continue;
+      const directory = text2(record.directory);
+      if (options.directory && directory && directory !== options.directory)
+        continue;
+      const time = record.time && typeof record.time === "object" ? record.time : {};
+      const updated = Number(time.updated ?? time.created ?? 0);
+      sessions.push({
+        id,
+        title: text2(record.title) || "未命名会话",
+        directory,
+        updatedAt: Number.isFinite(updated) ? updated : 0
+      });
+    }
+    return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+  };
+  const listTurns = async (sessionId) => {
+    const raw = asArray(await get(`/api/session/${encodeURIComponent(sessionId)}/message`));
+    const turns = [];
+    let current = null;
+    for (const item of raw) {
+      if (!item || typeof item !== "object")
+        continue;
+      const record = item;
+      const info = record.info && typeof record.info === "object" ? record.info : {};
+      const role = text2(info.role);
+      const at = Number(info.time?.created ?? 0);
+      const body = partText(record.parts);
+      if (role === "user") {
+        if (current)
+          turns.push(current);
+        current = { user: body, reply: "", at: Number.isFinite(at) ? at : Date.now() };
+      } else if (role === "assistant" && current) {
+        if (body)
+          current.reply = body;
+      }
+    }
+    if (current)
+      turns.push(current);
+    return turns;
+  };
+  return { listProjects, listSessions, listTurns };
+}
+
 // service/spool.ts
 import { mkdir as mkdir3, readFile as readFile3, readdir, rename as rename2, rm, writeFile as writeFile3 } from "node:fs/promises";
 import os2 from "node:os";
@@ -6205,12 +7279,14 @@ var server = http.createServer((request, response) => {
 });
 async function main() {
   store = await ConfigStore.open(DATA_DIR);
+  const opencode = createOpenCodeReader(process.env);
   bridge = new Bridge({
     store,
     host,
     dataDir: DATA_DIR,
     log,
-    onStateChange: emitState
+    onStateChange: emitState,
+    ...opencode ? { opencode } : {}
   });
   server.listen(PORT, "127.0.0.1", () => {
     log(`服务已启动，端口 ${PORT}`);

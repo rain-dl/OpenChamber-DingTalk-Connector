@@ -29,7 +29,7 @@
 [安装钉钉桥接](openchamber://extensions/install?path=D:/Workspace/Privates/Dailin/OpenChamber-DingTalk-Connector)
 ```
 
-安装时要批准四件事：本地服务（长连接）、会话控制（代你发消息、代你回答授权/提问）、会话事件与转写内容（把回复和问题读出来发到钉钉）、以及一个 OpenCode 插件（`send_dingtalk` 工具，插件代码以你的权限在 OpenCode 里运行）。
+安装时要批准五件事：本地服务（长连接）、会话控制（代你发消息、代你回答授权/提问）、会话事件与转写内容（把回复和问题读出来发到钉钉）、一个 OpenCode 插件（`send_dingtalk` 工具，插件代码以你的权限在 OpenCode 里运行），以及只读的 OpenCode 访问（`/s list`、`/ws list`、`/history` 要用）。
 
 ## 准备钉钉机器人
 
@@ -57,24 +57,30 @@
 
 ## 钉钉里的命令
 
-直接发消息（包括图片、文件、语音转写）就是给 agent 的指令。命令不经过模型：
+直接发消息（包括图片、文件、语音转写）就是给 agent 的指令。命令不经过模型，语法与上游 dsh-dingtalk 相同：
 
 | 命令 | 说明 |
 |---|---|
-| `/help`、`/h` | 命令一览 |
-| `/status` | 绑定、目录、运行状态、待回答的请求 |
-| `/new [标题]` | 下一条消息开新会话 |
-| `/sessions` | 最近由钉钉建过的会话，当前那个打 ✅ |
-| `/switch <序号>` | 切回旧会话 |
-| `/unbind` | 解除绑定 |
+| `/help`、`/h`、`/?` | 命令一览；`/help <命令>` 看该命令的全部例子 |
+| `/status [brief\|full]` | 连接、绑定、目录、各开关；`full` 加待处理请求与最近动态 |
 | `/stop` | 中断当前这一轮 |
-| `/dir [路径]` | 查看或设置默认项目目录 |
-| `/notify on\|off` | 其它会话结束时是否推到钉钉 |
-| `/pending`、`/rq` | 查看还等着的授权或提问 |
-| `/ping` | 连通性检查 |
-| `/id` | 你的 staffId 与当前会话 id |
+| `/next` | 重发被钉钉限流或发送失败而暂存的消息 |
+| `/session`、`/s` | `list [current] [all\|数量]` 列出全部会话；`switch [current] <编号\|会话 id>` 切过去；`new [标题]` 下一条消息开新会话；裸 `/s` 看状态 |
+| `/workspace`、`/ws` | `list [all\|数量]` 列出全部项目；`status` 看默认目录；`switch <编号\|路径>` 换目录；`add <路径>` 校验目录后换过去 |
+| `/history` | 默认最近 5 轮；`list all\|数量`、`show <编号>` 看全文 |
+| `/at` | `f <路径>` 引用文件到下一条消息；`rm <编号>`、`clear`；裸 `/at` 看已引用 |
+| `/merge`、`/mg` | `on\|off\|status`；开启后停顿合并，正文末尾 `..` 继续追加、`!!` 立即提交 |
+| `/media`、`/md` | `on\|off` 附件与下一条文字合并；`at\|path` 切换附件写法；裸 `/md` 看状态 |
+| `/notify`、`/watch` | `on\|off\|status` 其它会话结束时是否推到钉钉 |
+| `/surface`、`/wxprompt` | `on\|off\|status` 给 agent 注入「你在钉钉里对话」的渠道提示词 |
+| `/raw` | `on\|off\|once\|status` 强制透传：命令和文本原样交给 agent |
+| `/rq`、`/rp` | 关闭待处理的提问卡 / 拒绝待处理的权限卡；`P1=/rq` 点名第 1 张 |
 
-其它 `/xxx` 原样转给 agent（例如 OpenChamber 自带的 `/compact`）。
+其它 `/xxx` 原样转给 agent（例如 OpenChamber 自带的 `/compact`）；打错的命令（如 `/statu`）会给出正确拼写而不是转发。
+
+**OpenChamber 没有对应能力、因此未提供的命令**：`/fork`、`/preset`、`/model`、`/reasoning`、`/perm`、`/enter`、`/steps`、`/skill`、`/flush`，以及 `/s pin|unpin`、`/notify tasks`、`/at s`。这些能力在 OpenChamber 应用里照常可用，只是钉钉侧没有对应实现；`/help` 的页脚也会说明。
+
+`/s list`、`/ws list`、`/history` 需要「读取 OpenCode 会话」的权限（安装时的那一行），并同时读取项目与会话列表。
 
 ## 授权与提问
 - **授权**：钉钉收到「需要授权 · 动作 · 资源」，回复 **1** 允许一次，**2** 拒绝（`拒绝：原因` 会把原因带给 agent）。普通文字不算回答，照常发给 agent。
@@ -94,11 +100,11 @@
 
 ## 和上游 dsh-dingtalk 的差别
 
-保留：Stream 长连接与自动重连、消息回执与去重、session webhook → 机器人接口的回落、AI 卡片（创建/更新/收口）、图片与文件的双向传输、表情状态、单用户单会话绑定、授权/提问的中文格式、`send_dingtalk` 工具（改为 OpenCode 插件）。
+保留：Stream 长连接与自动重连、消息回执与去重、session webhook → 机器人接口的回落、AI 卡片（创建/更新/收口）、图片与文件的双向传输、表情状态、单用户单会话绑定、授权/提问的中文格式、`send_dingtalk` 工具（改为 OpenCode 插件）、以及命令语法（`/help`、`/status`、`/stop`、`/next`、`/session`、`/workspace`、`/history`、`/at`、`/merge`、`/media`、`/notify`、`/surface`、`/raw`、`/rq`、`/rp`）。
 
-换成 OpenChamber 契约：会话的创建/发送/停止/回答、跨会话提醒。
+换成 OpenChamber 契约：会话的创建/发送/停止/回答、跨会话提醒；`/s list`、`/ws list`、`/history` 通过宿主的只读 OpenCode 接口实现。
 
-没有移植（DSH 内部能力，OpenChamber 的服务契约没有对应接口）：`/workspace`、`/preset`、`/model`、`/perm`、`/reasoning`、`/fork`、`/history`、`/skill`、`/merge`、`/media`、`/at`、`/surface`、`/raw`、`/steps`。这些在应用里照常可用，只是钉钉侧没有对应命令。
+没有移植（DSH 内部能力，OpenChamber 的服务契约没有对应接口）：`/fork`、`/preset`、`/model`、`/reasoning`、`/perm`、`/enter`、`/steps`、`/skill`、`/flush`。这些在应用里照常可用，只是钉钉侧没有对应命令。
 
 ## 开发
 

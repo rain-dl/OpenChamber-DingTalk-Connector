@@ -7,17 +7,25 @@ import type { GuestSessionEventRequest, ServiceHost } from '@openchamber/sdk';
 
 import { Bridge } from '../service/bridge.js';
 import { ConfigStore } from '../service/config.js';
-import type { DingTalkApi } from '../service/dingtalk/api.js';
+import { DingTalkApiError, type DingTalkApi } from '../service/dingtalk/api.js';
 import type { RobotCallback } from '../service/dingtalk/types.js';
+import type { OpenCodeReader } from '../service/opencode.js';
 
 const dirs: string[] = [];
 
 type Recorded = { kind: string; [key: string]: unknown };
 
-function fakeApi(recorded: Recorded[]): DingTalkApi {
+function fakeApi(recorded: Recorded[], controls: { failTimes: number } = { failTimes: 0 }): DingTalkApi {
   const push = (kind: string, extra: Record<string, unknown> = {}) => recorded.push({ kind, ...extra });
   return {
-    sendSessionText: async (options: { text: string }) => push('webhook', { text: options.text }),
+    sendSessionText: async (options: { text: string }) => {
+      if (controls.failTimes > 0) {
+        controls.failTimes -= 1;
+        // 限流：sendTextMessage 不会回落到机器人接口，正是要测的排队场景。
+        throw new DingTalkApiError('send-rejected', '钉钉限流', { status: 429 });
+      }
+      push('webhook', { text: options.text });
+    },
     sendRobotText: async (options: { text: string }) => push('robot', { text: options.text }),
     sendFile: async () => push('file'),
     sendImage: async () => push('image'),
@@ -71,11 +79,18 @@ function fakeHost(state: { starts: unknown[]; sends: unknown[]; answers: unknown
   } as unknown as ServiceHost;
 }
 
-async function setup(): Promise<{
+async function setup(options: {
+  withReader?: boolean;
+  sessions?: Array<{ id: string; title: string; directory: string; updatedAt: number }>;
+  projects?: string[];
+  turns?: Array<{ user: string; reply: string; at: number }>;
+} = {}): Promise<{
   bridge: Bridge;
   store: ConfigStore;
   recorded: Recorded[];
   hostState: { starts: unknown[]; sends: unknown[]; answers: unknown[] };
+  controls: { failTimes: number };
+  readerCalls: string[];
 }> {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'dingtalk-bridge-'));
   dirs.push(dir);
@@ -88,15 +103,41 @@ async function setup(): Promise<{
   });
   const recorded: Recorded[] = [];
   const hostState = { starts: [], sends: [], answers: [] };
+  const controls = { failTimes: 0 };
+  const readerCalls: string[] = [];
+
+  const baseSessions = options.sessions ?? [
+    { id: 'ses_app_1', title: '应用里开的会话', directory: 'D:/proj', updatedAt: Date.now() - 60_000 },
+    { id: 'ses_app_2', title: '另一个会话', directory: 'D:/other', updatedAt: Date.now() - 120_000 },
+  ];
+  const reader: OpenCodeReader = {
+    listProjects: async () => {
+      readerCalls.push('projects');
+      return (options.projects ?? ['D:/proj', 'D:/other']).map((worktree, index) => ({ id: `p${index}`, worktree }));
+    },
+    listSessions: async (filter = {}) => {
+      readerCalls.push('sessions');
+      return baseSessions.filter((session) => !filter.directory || session.directory === filter.directory);
+    },
+    listTurns: async () => {
+      readerCalls.push('turns');
+      return options.turns ?? [
+        { user: '第一轮提问', reply: '第一轮回复', at: 1 },
+        { user: '第二轮提问', reply: '第二轮回复', at: 2 },
+      ];
+    },
+  };
+
   const bridge = new Bridge({
     store,
     host: fakeHost(hostState),
     dataDir: dir,
-    api: fakeApi(recorded),
+    api: fakeApi(recorded, controls),
     log: () => undefined,
     onStateChange: () => undefined,
+    ...(options.withReader === false ? {} : { opencode: reader }),
   });
-  return { bridge, store, recorded, hostState };
+  return { bridge, store, recorded, hostState, controls, readerCalls };
 }
 
 function callback(text: string, overrides: Partial<RobotCallback> = {}): RobotCallback {
@@ -229,40 +270,60 @@ describe('入站消息', () => {
     expect(hostState.sends).toEqual([{ sessionId: 'ses_1', prompt: '/compact' }]);
   });
 
-  test('/new 之后的下一条消息新建会话', async () => {
+  test('/s new 之后的下一条消息新建会话，标题生效', async () => {
     const { bridge, hostState, store } = await setup();
     bridge.handleInbound(callback('一'));
     await bridge.whenIdle();
-    bridge.handleInbound(callback('/new 第二个'));
+    bridge.handleInbound(callback('/s new 第二个'));
     await bridge.whenIdle();
     expect(store.binding).toBeNull();
 
     bridge.handleInbound(callback('二'));
     await bridge.whenIdle();
     expect(hostState.starts).toHaveLength(2);
+    expect(hostState.starts[1]).toMatchObject({ title: '第二个' });
     expect(store.binding?.sessionId).toBe('ses_2');
   });
 
-  test('/sessions 与 /switch 切回旧会话', async () => {
+  test('/s list 列出全部会话（含应用里开的），/s switch 切回去', async () => {
     const { bridge, recorded, store, hostState } = await setup();
     bridge.handleInbound(callback('一'));
     await bridge.whenIdle();
-    bridge.handleInbound(callback('/new'));
-    await bridge.whenIdle();
-    bridge.handleInbound(callback('二'));
-    await bridge.whenIdle();
 
-    bridge.handleInbound(callback('/sessions'));
+    bridge.handleInbound(callback('/s list'));
     await bridge.whenIdle();
-    expect(lastText(recorded)).toContain('ses_2');
+    const listing = lastText(recorded);
+    expect(listing).toContain('应用里开的会话');
+    expect(listing).toContain('ses_app_1');
+    expect(listing).toContain('ses_app_2');
+    expect(listing).toContain('共 2 个');
 
-    bridge.handleInbound(callback('/switch 2'));
+    bridge.handleInbound(callback('/s switch 2'));
     await bridge.whenIdle();
-    expect(store.binding?.sessionId).toBe('ses_1');
+    expect(store.binding?.sessionId).toBe('ses_app_2');
 
     bridge.handleInbound(callback('回到旧会话'));
     await bridge.whenIdle();
-    expect(hostState.sends).toEqual([{ sessionId: 'ses_1', prompt: '回到旧会话' }]);
+    expect(hostState.sends).toEqual([{ sessionId: 'ses_app_2', prompt: '回到旧会话' }]);
+  });
+
+  test('/s list current 只看当前目录', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('一'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/s list current'));
+    await bridge.whenIdle();
+    const listing = lastText(recorded);
+    expect(listing).toContain('ses_app_1');
+    expect(listing).not.toContain('ses_app_2');
+    expect(listing).toContain('当前目录');
+  });
+
+  test('没有读取权限时说清楚去哪批准', async () => {
+    const { bridge, recorded } = await setup({ withReader: false });
+    bridge.handleInbound(callback('/s list'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('设置 → 扩展');
   });
 
   test('附件会下载到本机并写进 prompt', async () => {
@@ -489,20 +550,357 @@ describe('会话事件', () => {  test('turn-finished 把回复发回钉钉', as
     ]);
   });
 
-  test('/pending 能看到还等着的请求', async () => {
-    const { bridge, recorded } = await setup();
+  test('/status 显示待处理请求，/rq 关闭提问卡、/rp 拒绝权限卡', async () => {
+    const { bridge, recorded, hostState } = await setup();
     bridge.handleInbound(callback('你好'));
     await bridge.whenIdle();
-    bridge.handleInbound(callback('/pending'));
+
+    bridge.handleInbound(callback('/status'));
     await bridge.whenIdle();
-    expect(lastText(recorded)).toContain('没有等待你回答');
+    expect(lastText(recorded)).toContain('模式：');
+    // 没有卡时 /rq 说明去哪了
+    bridge.handleInbound(callback('/rq'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('没有待处理的提问卡');
 
     await bridge.handleEvent(event('permission-asked', 'ses_1', null, { permission: { requestId: 'perm_1' } }));
-    bridge.handleInbound(callback('/pending'));
+    await bridge.handleEvent(event('question-asked', 'ses_1', {
+      type: 'question-asked',
+      sessionTitle: null,
+      ask: {
+        kind: 'form',
+        id: 'frm_9',
+        title: '选一个',
+        fields: [{
+          key: 'pick',
+          type: 'string',
+          title: '选项',
+          description: null,
+          required: true,
+          options: [{ value: 'a', label: 'A' }],
+        }],
+      },
+    }, { question: { kind: 'form', id: 'frm_9' } }));
+
+    bridge.handleInbound(callback('/status'));
     await bridge.whenIdle();
-    expect(lastText(recorded)).toContain('授权请求');
+    expect(lastText(recorded)).toContain('等你回答：2');
+
+    bridge.handleInbound(callback('/rq'));
+    await bridge.whenIdle();
+    expect(hostState.answers).toContainEqual({
+      kind: 'form',
+      sessionId: 'ses_1',
+      formId: 'frm_9',
+      values: null,
+    });
+
+    bridge.handleInbound(callback('/rp'));
+    await bridge.whenIdle();
+    expect(hostState.answers).toContainEqual({
+      kind: 'permission',
+      sessionId: 'ses_1',
+      requestId: 'perm_1',
+      answer: { decision: 'deny', message: '用户在钉钉里拒绝了' },
+    });
   });
 });
 
 
 
+
+describe('命令：帮助与状态', () => {
+  test('/help 列出已实现的命令，并说明哪些没有对应能力', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('/help'));
+    await bridge.whenIdle();
+    const help = lastText(recorded);
+    expect(help).toContain('/s');
+    expect(help).toContain('/ws');
+    expect(help).toContain('/mg');
+    expect(help).toContain('/history');
+    expect(help).toContain('没有对应能力的命令未提供');
+    expect(help).toContain('/fork');
+  });
+
+  test('/help <命令> 给出用法与例子', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('/help s'));
+    await bridge.whenIdle();
+    const topic = lastText(recorded);
+    expect(topic).toContain('用法：/session list');
+    expect(topic).toContain('/s list current');
+  });
+
+  test('/help 未知命令回清单而不是转发', async () => {
+    const { bridge, recorded, hostState } = await setup();
+    bridge.handleInbound(callback('/help fuck'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('没有 /fuck 这条命令');
+    expect(hostState.sends).toHaveLength(0);
+  });
+
+  test('/status brief 只给摘要，full 带运行状态', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/status brief'));
+    await bridge.whenIdle();
+    const brief = lastText(recorded);
+    expect(brief).toContain('模式：raw');
+    expect(brief).not.toContain('运行状态');
+
+    bridge.handleInbound(callback('/status full'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('运行状态：空闲');
+  });
+
+  test('打错的命令给提示，不当成聊天转给 agent', async () => {
+    const { bridge, recorded, hostState } = await setup();
+    bridge.handleInbound(callback('/statu'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('你想用的可能是 `/status`');
+    expect(hostState.starts).toHaveLength(0);
+  });
+
+  test('没有对应能力的上游命令会说明，而不是转给 agent', async () => {
+    const { bridge, recorded, hostState } = await setup();
+    bridge.handleInbound(callback('/model list'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('没有对应能力');
+    expect(lastText(recorded)).toContain('换模型');
+    expect(hostState.starts).toHaveLength(0);
+    expect(hostState.sends).toHaveLength(0);
+
+    bridge.handleInbound(callback('/s pin 1'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('/s pin');
+  });
+});
+
+describe('命令：工作区', () => {
+  test('/ws list 列出全部项目，/ws switch 换目录并解绑', async () => {
+    const dirA = await mkdtemp(path.join(os.tmpdir(), 'ws-a-'));
+    const dirB = await mkdtemp(path.join(os.tmpdir(), 'ws-b-'));
+    dirs.push(dirA, dirB);
+    const { bridge, recorded, store } = await setup({ projects: [dirA, dirB] });
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/ws list'));
+    await bridge.whenIdle();
+    const listing = lastText(recorded);
+    expect(listing).toContain(dirA);
+    expect(listing).toContain(dirB);
+    expect(listing).toContain('共 2 个');
+
+    bridge.handleInbound(callback('/ws switch 2'));
+    await bridge.whenIdle();
+    expect(store.settings.directory).toBe(dirB);
+    expect(store.binding).toBeNull();
+    expect(lastText(recorded)).toContain(dirB);
+  });
+
+  test('/ws add 只接受真实存在的目录', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'ws-add-'));
+    dirs.push(dir);
+    const { bridge, recorded, store } = await setup();
+    await store.patchSettings({ directory: '' });
+
+    bridge.handleInbound(callback('/ws add D:/definitely/missing'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('这个目录不存在');
+
+    bridge.handleInbound(callback(`/ws add ${dir}`));
+    await bridge.whenIdle();
+    expect(store.settings.directory).toBe(dir);
+  });
+
+  test('/ws status 显示默认目录与会话目录', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/ws status'));
+    await bridge.whenIdle();
+    const text = lastText(recorded);
+    expect(text).toContain('默认目录');
+    expect(text).toContain('D:/proj');
+  });
+});
+
+describe('命令：历史、引用、合并、媒体、透传、重发', () => {
+  test('/history 列出轮次，/history show 给全文', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/history'));
+    await bridge.whenIdle();
+    const listing = lastText(recorded);
+    expect(listing).toContain('共 2 轮');
+    expect(listing).toContain('第一轮提问');
+    expect(listing).toContain('第二轮提问');
+    expect(listing).toContain('第 2 轮全文');
+
+    bridge.handleInbound(callback('/history show 1'));
+    await bridge.whenIdle();
+    const shown = lastText(recorded);
+    expect(shown).toContain('**你**：第一轮提问');
+    expect(shown).toContain('**agent**：第一轮回复');
+  });
+
+  test('/at f 引用文件，随下一条消息发出', async () => {
+    const { bridge, recorded, hostState } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/at f D:/logs/build.log'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('已引用');
+
+    bridge.handleInbound(callback('/at'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('D:/logs/build.log');
+
+    bridge.handleInbound(callback('看看这个日志'));
+    await bridge.whenIdle();
+    const sent = String((hostState.sends[0] as { prompt: string }).prompt);
+    expect(sent).toContain('看看这个日志');
+    expect(sent).toContain('引用文件（/at）');
+    expect(sent).toContain('D:/logs/build.log');
+  });
+
+  test('/at s 说明没有对应能力', async () => {
+    const { bridge, recorded } = await setup();
+    bridge.handleInbound(callback('/at s 2'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('没有对应能力');
+    expect(lastText(recorded)).toContain('/at f');
+  });
+
+  test('/merge on：.. 追加、!! 立即提交', async () => {
+    const { bridge, hostState, recorded } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/merge on'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('已开启打字合并');
+
+    bridge.handleInbound(callback('帮我改下登录页 ..'));
+    await bridge.whenIdle();
+    expect(hostState.sends).toHaveLength(0);
+
+    bridge.handleInbound(callback('跑一下测试 !!'));
+    await bridge.whenIdle();
+    expect(hostState.sends).toEqual([
+      { sessionId: 'ses_1', prompt: '帮我改下登录页\n\n跑一下测试' },
+    ]);
+  });
+
+  test('/merge on：静默窗口后自动合并', async () => {
+    const { bridge, hostState } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/merge on'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('第一句'));
+    await bridge.whenIdle();
+    expect(hostState.sends).toHaveLength(0);
+    await new Promise((resolve) => setTimeout(resolve, 1_800));
+    await bridge.whenIdle();
+    expect(hostState.sends).toEqual([{ sessionId: 'ses_1', prompt: '第一句' }]);
+  });
+
+  test('/media on：无文字附件等下一条文字', async () => {
+    const { bridge, hostState } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/media on'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('', { msgtype: 'picture', text: undefined, content: { downloadCode: 'code-1' } }));
+    await bridge.whenIdle();
+    expect(hostState.sends).toHaveLength(0);
+
+    bridge.handleInbound(callback('这张图怎么看'));
+    await bridge.whenIdle();
+    const prompt = String((hostState.sends[0] as { prompt: string }).prompt);
+    expect(prompt).toContain('这张图怎么看');
+    expect(prompt).toContain('附件路径：');
+  });
+
+  test('/media at 换写法，/media off 发送暂存附件', async () => {
+    const { bridge, hostState, recorded, store } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/media at'));
+    await bridge.whenIdle();
+    expect(store.settings.mediaRef).toBe('at');
+
+    bridge.handleInbound(callback('/media on'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('', { msgtype: 'picture', text: undefined, content: { downloadCode: 'code-2' } }));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/media off'));
+    await bridge.whenIdle();
+    const prompt = String((hostState.sends[0] as { prompt: string }).prompt);
+    expect(prompt).toContain('@');
+    expect(lastText(recorded)).toContain('已关闭附件合并');
+  });
+
+  test('/raw on 之后命令也透传，只有 /raw 自己能关', async () => {
+    const { bridge, hostState, recorded } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/raw on'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('透传：开');
+
+    bridge.handleInbound(callback('/status'));
+    await bridge.whenIdle();
+    expect(hostState.sends).toEqual([{ sessionId: 'ses_1', prompt: '/status' }]);
+
+    bridge.handleInbound(callback('/raw off'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/status'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('钉钉桥接状态');
+  });
+
+  test('/raw once 只透传下一条', async () => {
+    const { bridge, hostState, recorded } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+    bridge.handleInbound(callback('/raw once'));
+    await bridge.whenIdle();
+
+    bridge.handleInbound(callback('/help'));
+    await bridge.whenIdle();
+    expect(hostState.sends[0]).toEqual({ sessionId: 'ses_1', prompt: '/help' });
+    expect(hostState.sends).toHaveLength(1);
+
+    bridge.handleInbound(callback('/help'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('/s');
+  });
+
+  test('/next 重发发送失败的消息', async () => {
+    const { bridge, recorded, controls } = await setup();
+    bridge.handleInbound(callback('你好'));
+    await bridge.whenIdle();
+
+    controls.failTimes = 1;
+    bridge.handleInbound(callback('/help'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).not.toContain('/session');
+
+    bridge.handleInbound(callback('/next'));
+    await bridge.whenIdle();
+    expect(lastText(recorded)).toContain('已重发 1 条');
+    expect(recorded.some((item) => item.kind === 'webhook' && String(item.text).includes('/s'))).toBe(true);
+  });
+});
